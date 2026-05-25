@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
@@ -30,6 +29,7 @@ from ..compat_agent import run_compat_agent_final, run_compat_agent_messages
 from ..config import Settings
 from ..limits import require_available_ai_tokens
 from .auth import CurrentUser, get_current_user
+from .run_store import RunStore
 
 
 class RunCreateRequest(BaseModel):
@@ -63,23 +63,6 @@ class ApproveRequest(BaseModel):
 
 
 @dataclass
-class CompatRun:
-    request_id: str
-    project_id: str
-    user_id: str
-    prompt: str
-    thread_id: str | None = None
-    auth_claims: dict[str, Any] = field(default_factory=dict)
-    status: str = "queued"
-    final_response: str | None = None
-    error: str | None = None
-    current_plan: list[dict[str, Any]] | None = None
-    events: list[dict[str, Any]] = field(default_factory=list)
-    subscribers: list[asyncio.Queue[dict[str, Any] | None]] = field(default_factory=list)
-    task: asyncio.Task[None] | None = None
-
-
-@dataclass
 class TokenUsageAccumulator:
     input_tokens: int = 0
     output_tokens: int = 0
@@ -93,188 +76,7 @@ class TokenUsageAccumulator:
         return bool(self.input_tokens or self.output_tokens)
 
 
-class CompatRunStore:
-    def __init__(self) -> None:
-        self._runs: dict[str, CompatRun] = {}
-        self._thread_messages: dict[tuple[str, str], list[dict[str, str]]] = {}
-        self._thread_project_ids: dict[tuple[str, str], str] = {}
-        self._thread_failed_tools: dict[tuple[str, str], dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def create(
-        self,
-        *,
-        project_id: str,
-        user_id: str,
-        prompt: str,
-        thread_id: str | None,
-        auth_claims: dict[str, Any],
-    ) -> CompatRun:
-        async with self._lock:
-            run = CompatRun(
-                request_id=str(uuid4()),
-                project_id=project_id,
-                user_id=user_id,
-                prompt=prompt,
-                thread_id=thread_id,
-                auth_claims=auth_claims,
-            )
-            self._runs[run.request_id] = run
-            return run
-
-    async def get(self, request_id: str, *, project_id: str, user_id: str) -> CompatRun | None:
-        async with self._lock:
-            run = self._runs.get(request_id)
-            if run is None or run.project_id != project_id or run.user_id != user_id:
-                return None
-            return run
-
-    async def thread_context(
-        self,
-        *,
-        user_id: str,
-        thread_id: str | None,
-        fallback_project_id: str,
-    ) -> tuple[list[dict[str, str]], str]:
-        if thread_id is None:
-            return [], fallback_project_id
-        key = (user_id, thread_id)
-        async with self._lock:
-            messages = list(self._thread_messages.get(key, []))
-            project_id = self._thread_project_ids.get(key) or fallback_project_id
-        return messages, project_id
-
-    async def append_thread_message(
-        self,
-        *,
-        user_id: str,
-        thread_id: str | None,
-        role: str,
-        content: str,
-        limit: int = 20,
-    ) -> None:
-        if thread_id is None or not content:
-            return
-        key = (user_id, thread_id)
-        async with self._lock:
-            messages = self._thread_messages.setdefault(key, [])
-            messages.append({"role": role, "content": content})
-            if len(messages) > limit:
-                del messages[: len(messages) - limit]
-
-    async def set_thread_project_id(self, *, user_id: str, thread_id: str | None, project_id: str | int | None) -> None:
-        if thread_id is None or project_id is None:
-            return
-        async with self._lock:
-            self._thread_project_ids[(user_id, thread_id)] = str(project_id)
-
-    async def last_failed_tool(self, *, user_id: str, thread_id: str | None) -> dict[str, Any] | None:
-        if thread_id is None:
-            return None
-        async with self._lock:
-            failed_tool = self._thread_failed_tools.get((user_id, thread_id))
-            return dict(failed_tool) if failed_tool else None
-
-    async def set_last_failed_tool(
-        self,
-        *,
-        user_id: str,
-        thread_id: str | None,
-        name: str,
-        arguments: dict[str, Any],
-        content: str,
-    ) -> None:
-        if thread_id is None:
-            return
-        async with self._lock:
-            self._thread_failed_tools[(user_id, thread_id)] = {
-                "name": name,
-                "arguments": dict(arguments),
-                "content": content,
-            }
-
-    async def clear_last_failed_tool(self, *, user_id: str, thread_id: str | None) -> None:
-        if thread_id is None:
-            return
-        async with self._lock:
-            self._thread_failed_tools.pop((user_id, thread_id), None)
-
-    async def set_status(
-        self,
-        request_id: str,
-        status: str,
-        *,
-        final_response: str | None = None,
-        error: str | None = None,
-    ) -> None:
-        async with self._lock:
-            run = self._runs.get(request_id)
-            if run is None:
-                return
-            run.status = status
-            if final_response is not None:
-                run.final_response = final_response
-            if error is not None:
-                run.error = error
-
-    async def add_event(self, request_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-        async with self._lock:
-            run = self._runs[request_id]
-            event = {
-                "seq": len(run.events) + 1,
-                "type": event_type,
-                "payload": payload,
-                "at": datetime.now(UTC).isoformat(),
-            }
-            run.events.append(event)
-            subscribers = list(run.subscribers)
-        for queue in subscribers:
-            await queue.put(event)
-        return event
-
-    async def list_events(self, request_id: str, *, since_seq: int = 0) -> list[dict[str, Any]]:
-        async with self._lock:
-            run = self._runs.get(request_id)
-            if run is None:
-                return []
-            return [event for event in run.events if int(event["seq"]) > since_seq]
-
-    async def subscribe(self, request_id: str) -> asyncio.Queue[dict[str, Any] | None]:
-        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        async with self._lock:
-            run = self._runs[request_id]
-            run.subscribers.append(queue)
-            if run.status in {"completed", "failed", "cancelled"}:
-                await queue.put(None)
-        return queue
-
-    async def unsubscribe(self, request_id: str, queue: asyncio.Queue[dict[str, Any] | None]) -> None:
-        async with self._lock:
-            run = self._runs.get(request_id)
-            if run and queue in run.subscribers:
-                run.subscribers.remove(queue)
-
-    async def finish_streams(self, request_id: str) -> None:
-        async with self._lock:
-            run = self._runs.get(request_id)
-            subscribers = list(run.subscribers) if run else []
-        for queue in subscribers:
-            await queue.put(None)
-
-    async def cancel(self, request_id: str, *, project_id: str, user_id: str) -> bool:
-        async with self._lock:
-            run = self._runs.get(request_id)
-            if run is None or run.project_id != project_id or run.user_id != user_id:
-                return False
-            if run.task and not run.task.done():
-                run.task.cancel()
-            run.status = "cancelled"
-        await self.add_event(request_id, "run_failed", {"error": "Run cancelled"})
-        await self.finish_streams(request_id)
-        return True
-
-
-def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRouter:
+def create_compat_router(store: RunStore, *, settings: Settings) -> APIRouter:
     router = APIRouter()
 
     @router.post("/projects/{project_id}/runs", response_model=RunCreateResponse)
@@ -291,7 +93,8 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
             thread_id=body.thread_id,
             auth_claims=user.claims,
         )
-        run.task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt, settings=settings))
+        task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt, settings=settings))
+        store.register_task(run.request_id, task)
         return RunCreateResponse(request_id=run.request_id, status="queued")
 
     @router.get("/projects/{project_id}/runs/{request_id}", response_model=RunStatusResponse)
@@ -365,7 +168,7 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
 
 
 async def _execute_run(
-    store: CompatRunStore,
+    store: RunStore,
     request_id: str,
     prompt: str,
     *,
@@ -381,18 +184,18 @@ async def _execute_run(
     usage = TokenUsageAccumulator()
     terminal_event: tuple[str, dict[str, Any]] | None = None
     try:
-        async with store._lock:
-            run = store._runs.get(request_id)
-            project_id = run.project_id if run else None
-            user_id = run.user_id if run else ""
-            thread_id = run.thread_id if run else None
-            auth_claims = run.auth_claims if run else {}
+        run = await store.get_execution_context(request_id)
+        project_id = run.project_id if run else None
+        user_id = run.user_id if run else ""
+        thread_id = run.thread_id if run else None
+        auth_claims = run.auth_claims if run else {}
         history, current_project_id = await store.thread_context(
             user_id=user_id,
             thread_id=thread_id,
             fallback_project_id=project_id or "",
         )
         await store.append_thread_message(user_id=user_id, thread_id=thread_id, role="user", content=prompt)
+        await _raise_if_cancel_requested(store, request_id)
 
         retry_tool = await store.last_failed_tool(user_id=user_id, thread_id=thread_id)
         if retry_tool and _is_retry_prompt(prompt):
@@ -418,6 +221,7 @@ async def _execute_run(
                 allow_tools=True,
             )
         usage.add(input_tokens=first_turn.input_tokens, output_tokens=first_turn.output_tokens)
+        await _raise_if_cancel_requested(store, request_id)
         if first_turn.text:
             await store.add_event(
                 request_id,
@@ -493,6 +297,7 @@ async def _execute_run(
             on_delta=emit_stream_progress,
         )
         usage.add(input_tokens=result.input_tokens, output_tokens=result.output_tokens)
+        await _raise_if_cancel_requested(store, request_id)
         flow = result.result.flow.model_dump(mode="json") if result.result.flow else None
         issues = [issue.model_dump(mode="json") for issue in result.result.issues]
         tool_content = "Flow compiled" if result.ok else "Flow validation failed"
@@ -559,6 +364,7 @@ async def _execute_run(
                 settings=settings,
             )
             usage.add(input_tokens=final_turn.input_tokens, output_tokens=final_turn.output_tokens)
+            await _raise_if_cancel_requested(store, request_id)
             message = final_turn.text or "Flow tayyor. Natija `tool_result.data.flow` ichida."
             await store.set_status(request_id, "completed", final_response=message)
             final_message = message
@@ -583,6 +389,7 @@ async def _execute_run(
             terminal_event = ("run_failed", {"error": message})
     except asyncio.CancelledError:
         await store.set_status(request_id, "cancelled", error="Run cancelled")
+        terminal_event = ("run_failed", {"error": "Run cancelled"})
         raise
     except Exception as exc:
         message = str(exc)
@@ -610,33 +417,46 @@ async def _execute_run(
             await store.add_event(request_id, terminal_event[0], terminal_event[1])
         if completed_successfully and final_message:
             await store.append_thread_message(user_id=user_id, thread_id=thread_id, role="assistant", content=final_message)
-        await store.finish_streams(request_id)
 
 
 async def _event_stream(
-    store: CompatRunStore,
+    store: RunStore,
     request_id: str,
     *,
     since_seq: int,
     heartbeat_seconds: float = 15.0,
+    poll_interval_seconds: float = 0.5,
 ) -> AsyncIterator[str]:
-    for event in await store.list_events(request_id, since_seq=since_seq):
-        yield _sse_event(event["type"], event)
-
-    queue = await store.subscribe(request_id)
-    try:
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), timeout=heartbeat_seconds)
-            except asyncio.TimeoutError:
-                yield ": heartbeat\n\n"
-                continue
-            if event is None:
+    last_heartbeat_at = asyncio.get_running_loop().time()
+    while True:
+        events = await store.list_events(request_id, since_seq=since_seq)
+        if events:
+            for event in events:
+                since_seq = int(event["seq"])
+                yield _sse_event(event["type"], event)
+                if event["type"] in {"run_completed", "run_failed"}:
+                    yield _sse_event("close", {"reason": "run_finished"})
+                    return
+            last_heartbeat_at = asyncio.get_running_loop().time()
+            continue
+        if await store.is_cancel_requested(request_id):
+            run = await store.get_execution_context(request_id)
+            if run is not None and run.status == "cancelled":
+                yield _sse_event(
+                    "run_failed",
+                    {
+                        "seq": since_seq + 1,
+                        "type": "run_failed",
+                        "payload": {"error": "Run cancelled"},
+                    },
+                )
                 yield _sse_event("close", {"reason": "run_finished"})
                 return
-            yield _sse_event(event["type"], event)
-    finally:
-        await store.unsubscribe(request_id, queue)
+        now = asyncio.get_running_loop().time()
+        if now - last_heartbeat_at >= heartbeat_seconds:
+            yield ": heartbeat\n\n"
+            last_heartbeat_at = now
+        await asyncio.sleep(poll_interval_seconds)
 
 
 def _sse_event(event_type: str, payload: dict[str, Any]) -> str:
@@ -730,7 +550,7 @@ async def save_flow_to_project(
 
 
 async def execute_backend_tool_loop(
-    store: CompatRunStore,
+    store: RunStore,
     request_id: str,
     *,
     first_turn: CompatAgentTurn,
@@ -750,6 +570,7 @@ async def execute_backend_tool_loop(
     last_content = ""
 
     for round_index in range(max_tool_rounds):
+        await _raise_if_cancel_requested(store, request_id)
         tool_content, tool_data, is_error = await execute_backend_tool(
             current_tool_call.name,
             current_tool_call.arguments,
@@ -790,6 +611,7 @@ async def execute_backend_tool_loop(
             allow_tools=not is_error and round_index + 1 < max_tool_rounds,
         )
         usage.add(input_tokens=next_turn.input_tokens, output_tokens=next_turn.output_tokens)
+        await _raise_if_cancel_requested(store, request_id)
         if next_turn.text:
             await store.add_event(
                 request_id,
@@ -823,6 +645,11 @@ async def execute_backend_tool_loop(
         current_tool_call = next_tool_call
 
     return last_content or "Tool limit reached.", False, 0, 0
+
+
+async def _raise_if_cancel_requested(store: RunStore, request_id: str) -> None:
+    if await store.is_cancel_requested(request_id):
+        raise asyncio.CancelledError
 
 
 def _tool_exchange_messages(

@@ -12,7 +12,7 @@ def main() -> None:
     settings = get_settings()
     host = settings.host
     port = settings.port
-    uvicorn.run("agentv4.main:app", host=host, port=port, reload=False)
+    uvicorn.run("agentv4.main:app", host=host, port=port, reload=False, workers=settings.workers)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,8 @@ class OpenAIResult:
 
 
 async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
+    import asyncio
+
     settings = get_settings()
     api_key = settings.openai_api_key
     if not api_key:
@@ -73,7 +75,7 @@ async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
         input_tokens += response.input_tokens
         output_tokens += response.output_tokens
         try:
-            commands = parse_commands(raw)
+            commands = await asyncio.to_thread(parse_commands, raw)
         except Exception as exc:
             last_error = exc
             feedback = (
@@ -81,7 +83,7 @@ async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
                 f"{exc}. Return exact BotBuilder command objects. Use `action`, not `command`."
             )
             continue
-        result = build_from_commands(commands)
+        result = await asyncio.to_thread(build_from_commands, commands)
         last_commands = commands
         last_result = result
         if result.ok:
@@ -114,6 +116,8 @@ async def build_bot_with_ai_stream(
     *,
     on_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> AIBuildResponse:
+    import asyncio
+
     settings = get_settings()
     api_key = settings.openai_api_key
     if not api_key:
@@ -142,7 +146,7 @@ async def build_bot_with_ai_stream(
         input_tokens += response.input_tokens
         output_tokens += response.output_tokens
         try:
-            commands = parse_commands(raw)
+            commands = await asyncio.to_thread(parse_commands, raw)
         except Exception as exc:
             last_error = exc
             feedback = (
@@ -150,7 +154,7 @@ async def build_bot_with_ai_stream(
                 f"{exc}. Return exact BotBuilder command objects. Use `action`, not `command`."
             )
             continue
-        result = build_from_commands(commands)
+        result = await asyncio.to_thread(build_from_commands, commands)
         last_commands = commands
         last_result = result
         if result.ok:

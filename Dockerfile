@@ -21,4 +21,4 @@ EXPOSE 8094
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8094/health', timeout=3).read()"
 
-CMD ["sh", "-c", "uvicorn agentv4.main:app --host ${AGENTV4_HOST} --port ${AGENTV4_PORT}"]
+CMD ["sh", "-c", "uvicorn agentv4.main:app --host ${AGENTV4_HOST} --port ${AGENTV4_PORT} --workers ${AGENTV4_WORKERS:-2}"]

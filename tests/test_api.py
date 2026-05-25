@@ -15,6 +15,12 @@ def compat_auth(monkeypatch):
     monkeypatch.setenv("AGENTV4_AUTH_REQUIRED", "false")
     monkeypatch.setenv("AGENTV4_ENFORCE_USAGE_LIMITS", "false")
     monkeypatch.setenv("AGENTV4_REPORT_TOKEN_USAGE", "false")
+    monkeypatch.delenv("AGENTV4_REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_HOST", raising=False)
+    monkeypatch.delenv("REDIS_PORT", raising=False)
+    monkeypatch.delenv("REDIS_ADDR", raising=False)
+    monkeypatch.delenv("REDIS_PASSWORD", raising=False)
     get_settings.cache_clear()
     get_backend_client.cache_clear()
     yield
@@ -110,6 +116,19 @@ def test_default_agent_model_is_gpt_5_2(monkeypatch) -> None:
     get_settings.cache_clear()
 
     assert get_settings().openai_model == "gpt-5.2"
+
+
+def test_redis_url_built_from_secret_env(monkeypatch) -> None:
+    monkeypatch.delenv("AGENTV4_REDIS_URL", raising=False)
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    monkeypatch.setenv("REDIS_HOST", "redis")
+    monkeypatch.setenv("REDIS_PORT", "6379")
+    monkeypatch.setenv("REDIS_PASSWORD", "secret")
+    get_settings.cache_clear()
+
+    settings = get_settings()
+    assert settings.redis_url == "redis://:secret@redis:6379/0"
+    assert settings.workers == 2
 
 
 def test_compat_run_reports_usage_once_and_emits_update(monkeypatch) -> None:

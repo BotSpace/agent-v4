@@ -16,7 +16,8 @@ from ..config import Settings, get_settings
 from ..engine_catalog import ENGINE_NODE_SPECS
 from ..limits import extract_ai_token_usage, require_available_ai_tokens
 from .auth import CurrentUser, get_current_user
-from .compat import CompatRunStore, create_compat_router
+from .compat import create_compat_router
+from .run_store import create_run_store
 
 
 class CreateSessionResponse(BaseModel):
@@ -54,7 +55,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="Botmother AgentV4 BotBuilder", version=__version__)
     app.dependency_overrides[get_settings] = lambda: s
     store = SessionStore()
-    compat_store = CompatRunStore()
+    compat_store = create_run_store(s)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
