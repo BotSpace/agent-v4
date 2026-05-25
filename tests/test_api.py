@@ -231,7 +231,7 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
             output_tokens=6,
         )
 
-    async def fake_agent_final(*_args, **_kwargs):
+    async def fake_agent_next(*_args, **_kwargs):
         return CompatAgentTurn(
             text="2 ta loyiha topildi: Kafe bot va Support bot.",
             input_tokens=3,
@@ -242,7 +242,7 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
         raise AssertionError("project listing should not call botbuilder")
 
     monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_final", fake_agent_final)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_next)
     monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fail_build_bot_with_ai_stream)
     monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
     client = TestClient(create_app())
@@ -268,6 +268,71 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
     assert status.status_code == 200
     assert status.json()["status"] == "completed"
     assert "2 ta loyiha topildi" in status.json()["final_response"]
+
+
+def test_agentv3_compat_can_chain_project_management_tools(monkeypatch) -> None:
+    class FakeBackend:
+        async def list_plans(self, *, auth_claims=None):
+            return [{"id": 11, "name": "Start", "price": "0", "currency": "UZS", "is_default": True}]
+
+        async def create_release(self, project_id, *, plan_id=None, months=None, auth_claims=None):
+            return {"id": 77, "project": project_id, "plan_id": plan_id, "months": months, "version": 1}
+
+    async def fake_agent_turn(_prompt, *, settings=None):
+        return CompatAgentTurn(
+            text="Avval tariflarni tekshiraman.",
+            tool_calls=[CompatToolCall(id="plans-call", name="plans_list", arguments={})],
+            input_tokens=5,
+            output_tokens=6,
+        )
+
+    calls = 0
+
+    async def fake_agent_next(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return CompatAgentTurn(
+                text="Start tarif topildi, deploy qilaman.",
+                tool_calls=[
+                    CompatToolCall(
+                        id="deploy-call",
+                        name="release_deploy",
+                        arguments={"plan_id": 11, "months": 1},
+                    )
+                ],
+                input_tokens=7,
+                output_tokens=8,
+            )
+        return CompatAgentTurn(
+            text="Deploy navbatga qo'yildi: release id=77.",
+            input_tokens=3,
+            output_tokens=4,
+        )
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_next)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/projects/project_9/runs",
+        json={"prompt": "loyihani deploy qil", "thread_id": "thread_1"},
+    )
+    assert created.status_code == 200
+    request_id = created.json()["request_id"]
+
+    with client.stream("GET", f"/projects/project_9/runs/{request_id}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "plans.list" in stream_text
+    assert "release.deploy" in stream_text
+    assert "release id=77" in stream_text
+
+    status = client.get(f"/projects/project_9/runs/{request_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
 
 
 def test_run_requires_auth_when_enabled(monkeypatch) -> None:

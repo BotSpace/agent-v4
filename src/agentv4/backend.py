@@ -156,6 +156,368 @@ class BackendClient:
     async def delete_project(self, project_id: str | int, *, auth_claims: dict | None = None) -> None:
         await self._request("DELETE", f"/api/project/{project_id}/", **_auth_kw(auth_claims))
 
+    async def list_env(
+        self,
+        project_id: str | int,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request("GET", "/api/enviroment/", params={"project": project_id}, **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def create_env(self, body: dict[str, Any], *, auth_claims: dict | None = None) -> dict[str, Any]:
+        payload = await self._request("POST", "/api/enviroment/", json=body, **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def delete_env(self, env_id: str | int, *, auth_claims: dict | None = None) -> None:
+        await self._request("DELETE", f"/api/enviroment/{env_id}/", **_auth_kw(auth_claims))
+
+    async def list_releases(
+        self,
+        project_id: str | int,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request("GET", "/api/relase/", params={"project": project_id}, **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def create_release(
+        self,
+        project_id: str | int,
+        *,
+        plan_id: int | None = None,
+        months: int | None = None,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        body: dict[str, Any] = {"project": project_id}
+        if plan_id is not None:
+            body["plan_id"] = plan_id
+        if months is not None:
+            body["months"] = months
+        payload = await self._request("POST", "/api/relase/", json=body, **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def list_plans(self, *, auth_claims: dict | None = None) -> list[dict[str, Any]]:
+        payload = await self._request("GET", "/api/plans/", **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def list_files(
+        self,
+        project_id: str | int | None = None,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"project": project_id} if project_id is not None else None
+        payload = await self._request("GET", "/api/file/", params=params, **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def delete_file(self, file_id: str | int, *, auth_claims: dict | None = None) -> None:
+        await self._request("DELETE", f"/api/file/{file_id}/", **_auth_kw(auth_claims))
+
+    async def list_collections(
+        self,
+        project_id: str | int,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request("GET", "/api/collection/", params={"project": project_id}, **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def get_collection(self, collection_id: str | int, *, auth_claims: dict | None = None) -> dict[str, Any]:
+        payload = await self._request("GET", f"/api/collection/{collection_id}/", **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def list_chat_users(
+        self,
+        project_id: str | int,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request("GET", f"/api/chat/users/{project_id}/", **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def user_chat_history(
+        self,
+        project_id: str | int,
+        chat_id: str | int,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request("GET", f"/api/chat/messages/{project_id}/{chat_id}/", **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def list_messages(
+        self,
+        project_id: str | int | None = None,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"project": project_id} if project_id is not None else None
+        payload = await self._request("GET", "/api/message/", params=params, **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def create_message(self, body: dict[str, Any], *, auth_claims: dict | None = None) -> dict[str, Any]:
+        payload = await self._request("POST", "/api/message/", json=body, **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def delete_message(self, message_id: str | int, *, auth_claims: dict | None = None) -> None:
+        await self._request("DELETE", f"/api/message/{message_id}/", **_auth_kw(auth_claims))
+
+    def _cms(self, path: str) -> str:
+        return f"/api/cms{path}"
+
+    async def cms_list_collections(
+        self,
+        project_id: str | int,
+        *,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        payload = await self._request("GET", self._cms(f"/projects/{project_id}/collections/"), **_auth_kw(auth_claims))
+        return payload if isinstance(payload, list) else _unwrap_list(payload)
+
+    async def cms_get_collection(
+        self,
+        project_id: str | int,
+        name: str,
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "GET",
+            self._cms(f"/projects/{project_id}/collections/{name}/"),
+            **_auth_kw(auth_claims),
+        )
+        return _unwrap_item(payload)
+
+    async def cms_create_collection(
+        self,
+        project_id: str | int,
+        body: dict[str, Any],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            self._cms(f"/projects/{project_id}/collections/"),
+            json=body,
+            **_auth_kw(auth_claims),
+        )
+        return _unwrap_item(payload)
+
+    async def cms_delete_collection(
+        self,
+        project_id: str | int,
+        name: str,
+        *,
+        auth_claims: dict | None = None,
+    ) -> None:
+        await self._request(
+            "DELETE",
+            self._cms(f"/projects/{project_id}/collections/{name}/"),
+            **_auth_kw(auth_claims),
+        )
+
+    async def cms_add_field(
+        self,
+        project_id: str | int,
+        name: str,
+        body: dict[str, Any],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            self._cms(f"/projects/{project_id}/collections/{name}/fields/"),
+            json=body,
+            **_auth_kw(auth_claims),
+        )
+        return _unwrap_item(payload)
+
+    async def cms_update_field(
+        self,
+        project_id: str | int,
+        name: str,
+        field_name: str,
+        body: dict[str, Any],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "PATCH",
+            self._cms(f"/projects/{project_id}/collections/{name}/fields/{field_name}/"),
+            json=body,
+            **_auth_kw(auth_claims),
+        )
+        return _unwrap_item(payload)
+
+    async def cms_remove_field(
+        self,
+        project_id: str | int,
+        name: str,
+        field_name: str,
+        *,
+        auth_claims: dict | None = None,
+    ) -> None:
+        await self._request(
+            "DELETE",
+            self._cms(f"/projects/{project_id}/collections/{name}/fields/{field_name}/"),
+            **_auth_kw(auth_claims),
+        )
+
+    async def cms_list_documents(
+        self,
+        project_id: str | int,
+        name: str,
+        *,
+        filter: dict[str, Any] | None = None,
+        sort: str | None = None,
+        limit: int = 50,
+        skip: int = 0,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        import json as _json
+
+        params: dict[str, Any] = {"limit": limit, "skip": skip}
+        if filter:
+            params["filter"] = _json.dumps(filter)
+        if sort:
+            params["sort"] = sort
+        payload = await self._request(
+            "GET",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/"),
+            params=params,
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {"results": []}
+
+    async def cms_get_document(
+        self,
+        project_id: str | int,
+        name: str,
+        document_id: str,
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "GET",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/{document_id}/"),
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def cms_insert(
+        self,
+        project_id: str | int,
+        name: str,
+        document: dict[str, Any],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/"),
+            json=document,
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def cms_bulk_insert(
+        self,
+        project_id: str | int,
+        name: str,
+        documents: list[dict[str, Any]],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/bulk/"),
+            json={"documents": documents},
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def cms_update(
+        self,
+        project_id: str | int,
+        name: str,
+        document_id: str,
+        patch: dict[str, Any],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "PATCH",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/{document_id}/"),
+            json=patch,
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def cms_delete(
+        self,
+        project_id: str | int,
+        name: str,
+        document_id: str,
+        *,
+        auth_claims: dict | None = None,
+    ) -> None:
+        await self._request(
+            "DELETE",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/{document_id}/"),
+            **_auth_kw(auth_claims),
+        )
+
+    async def cms_restore(
+        self,
+        project_id: str | int,
+        name: str,
+        document_id: str,
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/{document_id}/restore/"),
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def cms_aggregate(
+        self,
+        project_id: str | int,
+        name: str,
+        pipeline: list[dict[str, Any]],
+        *,
+        limit: int = 500,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            self._cms(f"/projects/{project_id}/collections/{name}/documents/aggregate/"),
+            json={"pipeline": pipeline, "limit": limit},
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, dict) else {}
+
+    async def cms_audit(
+        self,
+        project_id: str | int,
+        name: str,
+        *,
+        action: str | None = None,
+        document_id: str | None = None,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {key: value for key, value in {"action": action, "document_id": document_id}.items() if value}
+        payload = await self._request(
+            "GET",
+            self._cms(f"/projects/{project_id}/collections/{name}/audit/"),
+            params=params or None,
+            **_auth_kw(auth_claims),
+        )
+        return payload if isinstance(payload, list) else _unwrap_list(payload)
+
     async def report_token_usage(
         self,
         *,
