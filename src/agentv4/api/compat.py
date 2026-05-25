@@ -8,11 +8,15 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from ..ai import AIBuildRequest, build_bot_with_ai
+from ..backend import get_backend_client
+from ..config import Settings
+from ..limits import require_available_ai_tokens
+from .auth import CurrentUser, get_current_user
 
 
 class RunCreateRequest(BaseModel):
@@ -49,8 +53,10 @@ class ApproveRequest(BaseModel):
 class CompatRun:
     request_id: str
     project_id: str
+    user_id: str
     prompt: str
     thread_id: str | None = None
+    auth_claims: dict[str, Any] = field(default_factory=dict)
     status: str = "queued"
     final_response: str | None = None
     error: str | None = None
@@ -65,16 +71,31 @@ class CompatRunStore:
         self._runs: dict[str, CompatRun] = {}
         self._lock = asyncio.Lock()
 
-    async def create(self, *, project_id: str, prompt: str, thread_id: str | None) -> CompatRun:
+    async def create(
+        self,
+        *,
+        project_id: str,
+        user_id: str,
+        prompt: str,
+        thread_id: str | None,
+        auth_claims: dict[str, Any],
+    ) -> CompatRun:
         async with self._lock:
-            run = CompatRun(request_id=str(uuid4()), project_id=project_id, prompt=prompt, thread_id=thread_id)
+            run = CompatRun(
+                request_id=str(uuid4()),
+                project_id=project_id,
+                user_id=user_id,
+                prompt=prompt,
+                thread_id=thread_id,
+                auth_claims=auth_claims,
+            )
             self._runs[run.request_id] = run
             return run
 
-    async def get(self, request_id: str, *, project_id: str) -> CompatRun | None:
+    async def get(self, request_id: str, *, project_id: str, user_id: str) -> CompatRun | None:
         async with self._lock:
             run = self._runs.get(request_id)
-            if run is None or run.project_id != project_id:
+            if run is None or run.project_id != project_id or run.user_id != user_id:
                 return None
             return run
 
@@ -140,10 +161,10 @@ class CompatRunStore:
         for queue in subscribers:
             await queue.put(None)
 
-    async def cancel(self, request_id: str, *, project_id: str) -> bool:
+    async def cancel(self, request_id: str, *, project_id: str, user_id: str) -> bool:
         async with self._lock:
             run = self._runs.get(request_id)
-            if run is None or run.project_id != project_id:
+            if run is None or run.project_id != project_id or run.user_id != user_id:
                 return False
             if run.task and not run.task.done():
                 run.task.cancel()
@@ -153,18 +174,33 @@ class CompatRunStore:
         return True
 
 
-def create_compat_router(store: CompatRunStore) -> APIRouter:
+def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRouter:
     router = APIRouter()
 
     @router.post("/projects/{project_id}/runs", response_model=RunCreateResponse)
-    async def create_run(project_id: str, body: RunCreateRequest) -> RunCreateResponse:
-        run = await store.create(project_id=project_id, prompt=body.prompt, thread_id=body.thread_id)
-        run.task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt))
+    async def create_run(
+        project_id: str,
+        body: RunCreateRequest,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> RunCreateResponse:
+        await require_available_ai_tokens(user, settings)
+        run = await store.create(
+            project_id=project_id,
+            user_id=user.user_id,
+            prompt=body.prompt,
+            thread_id=body.thread_id,
+            auth_claims=user.claims,
+        )
+        run.task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt, settings=settings))
         return RunCreateResponse(request_id=run.request_id, status="queued")
 
     @router.get("/projects/{project_id}/runs/{request_id}", response_model=RunStatusResponse)
-    async def get_run(project_id: str, request_id: str) -> RunStatusResponse:
-        run = await store.get(request_id, project_id=project_id)
+    async def get_run(
+        project_id: str,
+        request_id: str,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> RunStatusResponse:
+        run = await store.get(request_id, project_id=project_id, user_id=user.user_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return RunStatusResponse(
@@ -176,8 +212,13 @@ def create_compat_router(store: CompatRunStore) -> APIRouter:
         )
 
     @router.get("/projects/{project_id}/runs/{request_id}/events")
-    async def stream_events(project_id: str, request_id: str, since_seq: int = 0) -> StreamingResponse:
-        run = await store.get(request_id, project_id=project_id)
+    async def stream_events(
+        project_id: str,
+        request_id: str,
+        since_seq: int = 0,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> StreamingResponse:
+        run = await store.get(request_id, project_id=project_id, user_id=user.user_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return StreamingResponse(
@@ -187,29 +228,43 @@ def create_compat_router(store: CompatRunStore) -> APIRouter:
         )
 
     @router.post("/projects/{project_id}/runs/{request_id}/clarify")
-    async def clarify_run(project_id: str, request_id: str, _: ClarifyRequest) -> dict[str, str]:
-        run = await store.get(request_id, project_id=project_id)
+    async def clarify_run(
+        project_id: str,
+        request_id: str,
+        _: ClarifyRequest,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> dict[str, str]:
+        run = await store.get(request_id, project_id=project_id, user_id=user.user_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return {"status": run.status}
 
     @router.post("/projects/{project_id}/runs/{request_id}/approve")
-    async def approve_run(project_id: str, request_id: str, body: ApproveRequest) -> dict[str, str]:
-        run = await store.get(request_id, project_id=project_id)
+    async def approve_run(
+        project_id: str,
+        request_id: str,
+        body: ApproveRequest,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> dict[str, str]:
+        run = await store.get(request_id, project_id=project_id, user_id=user.user_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
         return {"status": run.status, "approved": "true" if body.approved else "false"}
 
     @router.post("/projects/{project_id}/runs/{request_id}/cancel")
-    async def cancel_run(project_id: str, request_id: str) -> dict[str, str]:
-        if not await store.cancel(request_id, project_id=project_id):
+    async def cancel_run(
+        project_id: str,
+        request_id: str,
+        user: CurrentUser = Depends(get_current_user),
+    ) -> dict[str, str]:
+        if not await store.cancel(request_id, project_id=project_id, user_id=user.user_id):
             raise HTTPException(status_code=404, detail="Run not found")
         return {"status": "cancelling"}
 
     return router
 
 
-async def _execute_run(store: CompatRunStore, request_id: str, prompt: str) -> None:
+async def _execute_run(store: CompatRunStore, request_id: str, prompt: str, *, settings: Settings) -> None:
     await store.set_status(request_id, "running")
     await store.add_event(request_id, "run_started", {"request_id": request_id})
     tool_call_id = f"tool-{request_id[:8]}"
@@ -220,6 +275,21 @@ async def _execute_run(store: CompatRunStore, request_id: str, prompt: str) -> N
     )
     try:
         result = await build_bot_with_ai(AIBuildRequest(prompt=prompt, language="uz", max_repair_attempts=2))
+        async with store._lock:
+            run = store._runs.get(request_id)
+            project_id = run.project_id if run else None
+            user_id = run.user_id if run else ""
+        if settings.report_token_usage and (result.input_tokens or result.output_tokens):
+            try:
+                backend = get_backend_client(settings)
+                await backend.report_token_usage(
+                    user_id=user_id,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    project_id=project_id,
+                )
+            except Exception:
+                pass
         flow = result.result.flow.model_dump(mode="json") if result.result.flow else None
         issues = [issue.model_dump(mode="json") for issue in result.result.issues]
         await store.add_event(

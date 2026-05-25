@@ -20,6 +20,9 @@ docker run --rm -p 8094:8094 \
   -e AGENTV4_OPENAI_MODEL=gpt-4o-mini \
   -e AGENTV4_OPENAI_TIMEOUT=45 \
   -e AGENTV4_OPENAI_MAX_TOKENS=1800 \
+  -e AGENTV4_INTERNAL_API_TOKEN="$AGENT_INTERNAL_API_TOKEN" \
+  -e BACKEND_BASE_URL="http://backend:8000" \
+  -e BACKEND_INTERNAL_TOKEN="$BACKEND_INTERNAL_TOKEN" \
   agentv4
 ```
 
@@ -27,6 +30,7 @@ docker run --rm -p 8094:8094 \
 
 ```bash
 curl -X POST http://localhost:8094/v1/build \
+  -H 'Authorization: Bearer <access-token>' \
   -H 'content-type: application/json' \
   -d '{
     "commands": [
@@ -42,8 +46,10 @@ curl -X POST http://localhost:8094/v1/build \
 ## Session API
 
 ```bash
-curl -X POST http://localhost:8094/v1/sessions
+curl -X POST http://localhost:8094/v1/sessions \
+  -H 'Authorization: Bearer <access-token>'
 curl -X POST http://localhost:8094/v1/sessions/{session_id}/commands \
+  -H 'Authorization: Bearer <access-token>' \
   -H 'content-type: application/json' \
   -d '{"command":{"action":"create_bot","name":"Support bot","language":"uz"}}'
 ```
@@ -59,8 +65,31 @@ export AGENTV4_OPENAI_TIMEOUT=45
 export AGENTV4_OPENAI_MAX_TOKENS=1800
 
 curl -X POST http://localhost:8094/v1/ai/build \
+  -H 'Authorization: Bearer <access-token>' \
   -H 'content-type: application/json' \
   -d '{"prompt":"pizza buyurtma qabul qiladigan bot yarat","language":"uz"}'
+```
+
+## Auth And Limits
+
+AgentV4 carries forward AgentV3-style request protection:
+
+- `Authorization: Bearer <jwt>` validates the user token with `JWT_PUBLIC_KEY` or `JWT_PUBLIC_KEY_PATH`.
+- `X-Internal-Token` is accepted when it matches `AGENTV4_INTERNAL_API_TOKEN` or `AGENT_INTERNAL_API_TOKEN`.
+- `/usage`, `/v1/*`, and `/projects/{project_id}/runs/*` require auth by default.
+- AI endpoints and AgentV3-compatible run creation check `/api/subscription/usage/` before spending tokens.
+- Successful AI runs report token usage to `/api/subscription/usage/report/` when provider usage is available.
+
+Useful runtime envs:
+
+```bash
+AGENTV4_AUTH_REQUIRED=true
+AGENTV4_ENFORCE_USAGE_LIMITS=true
+AGENTV4_REPORT_TOKEN_USAGE=true
+BACKEND_BASE_URL=http://localhost:8000
+BACKEND_INTERNAL_TOKEN=...
+JWT_ALGORITHM=RS256
+JWT_PUBLIC_KEY_PATH=keys/public.pem
 ```
 
 ## Supported Commands
@@ -131,6 +160,8 @@ AgentV4 exposes the endpoints used by the current dashboard agent UI:
 - `POST /projects/{project_id}/runs/{request_id}/cancel`
 - `GET /usage`
 
+These endpoints use the same bearer/internal-token auth and backend-backed AI token limit check as AgentV3.
+
 Point the dashboard to AgentV4:
 
 ```bash
@@ -142,6 +173,7 @@ The compatibility run API streams AgentV3-style SSE events: `run_started`, `tool
 Current compatibility scope:
 
 - Creates and compiles Botmother flow JSON via AgentV4.
+- Enforces auth and monthly AI token limits through the Django backend.
 - Returns the compiled flow in `tool_result.data.flow`.
 - Keeps run state in memory.
 - Does not yet persist flow to backend project releases automatically.

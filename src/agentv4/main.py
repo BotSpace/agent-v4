@@ -1,17 +1,17 @@
 from __future__ import annotations
 
-import os
-
 import uvicorn
 
 from .api.app import create_app
+from .config import get_settings
 
 app = create_app()
 
 
 def main() -> None:
-    host = os.getenv("AGENTV4_HOST", "0.0.0.0")
-    port = int(os.getenv("AGENTV4_PORT", "8094"))
+    settings = get_settings()
+    host = settings.host
+    port = settings.port
     uvicorn.run("agentv4.main:app", host=host, port=port, reload=False)
 
 

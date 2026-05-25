@@ -1,9 +1,24 @@
 from fastapi.testclient import TestClient
+import pytest
 
 from agentv4.api.app import create_app
 from agentv4.ai import AIBuildResponse
+from agentv4.backend import get_backend_client
 from agentv4.builder.commands import CreateBotCommand, AddTextCommand
 from agentv4.builder.session import build_from_commands
+from agentv4.config import get_settings
+
+
+@pytest.fixture(autouse=True)
+def compat_auth(monkeypatch):
+    monkeypatch.setenv("AGENTV4_AUTH_REQUIRED", "false")
+    monkeypatch.setenv("AGENTV4_ENFORCE_USAGE_LIMITS", "false")
+    monkeypatch.setenv("AGENTV4_REPORT_TOKEN_USAGE", "false")
+    get_settings.cache_clear()
+    get_backend_client.cache_clear()
+    yield
+    get_settings.cache_clear()
+    get_backend_client.cache_clear()
 
 
 def test_health() -> None:
@@ -128,3 +143,36 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
     assert status.status_code == 200
     assert status.json()["status"] == "completed"
     assert "Bot flow tayyor" in status.json()["final_response"]
+
+
+def test_run_requires_auth_when_enabled(monkeypatch) -> None:
+    monkeypatch.setenv("AGENTV4_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("AGENTV4_ENFORCE_USAGE_LIMITS", "false")
+    get_settings.cache_clear()
+
+    client = TestClient(create_app())
+    response = client.post("/projects/project_1/runs", json={"prompt": "Bot yarat"})
+
+    assert response.status_code == 401
+
+
+def test_run_rejects_exhausted_token_limit(monkeypatch) -> None:
+    class FakeBackend:
+        async def subscription_usage(self, *, auth_claims=None):
+            return {"ai_token_usage": {"remaining": 0, "used": 10, "limit": 10}}
+
+    monkeypatch.setenv("AGENTV4_AUTH_REQUIRED", "true")
+    monkeypatch.setenv("AGENTV4_INTERNAL_API_TOKEN", "secret")
+    monkeypatch.setenv("AGENTV4_ENFORCE_USAGE_LIMITS", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr("agentv4.limits.get_backend_client", lambda settings: FakeBackend())
+
+    client = TestClient(create_app())
+    response = client.post(
+        "/projects/project_1/runs",
+        headers={"X-Internal-Token": "secret"},
+        json={"prompt": "Bot yarat"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["detail"]["tokens_remaining"] == 0

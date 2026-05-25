@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 from pydantic import BaseModel, Field, TypeAdapter
@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field, TypeAdapter
 from .builder.commands import BotCommand
 from .builder.models import CompileResult
 from .builder.session import build_from_commands
+from .config import get_settings
 from .engine_catalog import engine_catalog_prompt
 
 COMMANDS_ADAPTER = TypeAdapter(list[BotCommand])
@@ -30,28 +31,43 @@ class AIBuildResponse(BaseModel):
     attempts: int
     commands: list[dict[str, Any]]
     result: CompileResult
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 class AIConfigurationError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class OpenAIResult:
+    content: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
 async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
-    api_key = os.getenv("OPENAI_API_KEY")
+    settings = get_settings()
+    api_key = settings.openai_api_key
     if not api_key:
         raise AIConfigurationError("OPENAI_API_KEY is not configured")
 
-    model = request.model or os.getenv("AGENTV4_OPENAI_MODEL", "gpt-4o-mini")
+    model = request.model or settings.openai_model
 
     attempts = 0
     feedback = ""
     last_commands: list[BotCommand] = []
     last_result: CompileResult | None = None
     last_error: Exception | None = None
+    input_tokens = 0
+    output_tokens = 0
 
     while attempts <= request.max_repair_attempts:
         attempts += 1
-        raw = await call_openai(api_key=api_key, model=model, request=request, feedback=feedback)
+        response = await call_openai(api_key=api_key, model=model, request=request, feedback=feedback)
+        raw = response.content
+        input_tokens += response.input_tokens
+        output_tokens += response.output_tokens
         try:
             commands = parse_commands(raw)
         except Exception as exc:
@@ -71,6 +87,8 @@ async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
                 attempts=attempts,
                 commands=[command.model_dump(mode="json") for command in commands],
                 result=result,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
         feedback = format_issues(result)
 
@@ -82,6 +100,8 @@ async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
         attempts=attempts,
         commands=[command.model_dump(mode="json") for command in last_commands],
         result=last_result,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
     )
 
 
@@ -91,10 +111,10 @@ async def call_openai(
     model: str,
     request: AIBuildRequest,
     feedback: str,
-) -> str:
+) -> OpenAIResult:
     import asyncio
 
-    timeout = float(os.getenv("AGENTV4_OPENAI_TIMEOUT", "45"))
+    timeout = get_settings().openai_timeout
     return await asyncio.wait_for(
         asyncio.to_thread(
             call_openai_sync,
@@ -113,7 +133,8 @@ def call_openai_sync(
     model: str,
     request: AIBuildRequest,
     feedback: str,
-) -> str:
+) -> OpenAIResult:
+    settings = get_settings()
     payload = {
         "model": model,
         "messages": [
@@ -125,9 +146,9 @@ def call_openai_sync(
         ],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
-        "max_tokens": int(os.getenv("AGENTV4_OPENAI_MAX_TOKENS", "1800")),
+        "max_tokens": settings.openai_max_tokens,
     }
-    timeout = float(os.getenv("AGENTV4_OPENAI_TIMEOUT", "45"))
+    timeout = settings.openai_timeout
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -147,7 +168,10 @@ def call_openai_sync(
     content = body["choices"][0]["message"].get("content")
     if not content:
         raise ValueError("OpenAI returned an empty response")
-    return str(content)
+    usage = body.get("usage") if isinstance(body, dict) else None
+    input_tokens = int((usage or {}).get("prompt_tokens") or 0)
+    output_tokens = int((usage or {}).get("completion_tokens") or 0)
+    return OpenAIResult(content=str(content), input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 def parse_commands(raw: str) -> list[BotCommand]:

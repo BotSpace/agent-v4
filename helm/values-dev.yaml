@@ -8,6 +8,13 @@ configMaps:
     AGENTV4_OPENAI_MODEL: "gpt-4o-mini"
     AGENTV4_OPENAI_TIMEOUT: "45"
     AGENTV4_OPENAI_MAX_TOKENS: "1800"
+    AGENTV4_AUTH_REQUIRED: "true"
+    AGENTV4_ENFORCE_USAGE_LIMITS: "true"
+    AGENTV4_REPORT_TOKEN_USAGE: "true"
+    AGENTV4_BACKEND_TIMEOUT: "30"
+    BACKEND_BASE_URL: "http://web:8000"
+    JWT_ALGORITHM: "HS256"
+    JWT_PUBLIC_KEY_PATH: "/app/keys/public.pem"
 
 resources:
   requests:
