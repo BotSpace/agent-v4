@@ -218,7 +218,6 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
 
     assert "event: run_started" in stream_text
     assert "event: tool_call" in stream_text
-    assert "event: thinking_delta" in stream_text
     assert "event: tool_result" in stream_text
     assert "project.update" in stream_text
     assert "event: assistant_message" in stream_text
@@ -257,8 +256,6 @@ def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
         stream_text = "".join(response.iter_text())
 
     assert "event: assistant_message" in stream_text
-    assert "So'rov tahlil qilinmoqda" in stream_text
-    assert "Tool kerak emas, javob tayyorlanmoqda" in stream_text
     assert "botbuilder.ai_build" not in stream_text
     assert "Men Botmother AgentV4man" in stream_text
 
@@ -321,8 +318,6 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
 
     assert "event: tool_call" in stream_text
     assert "project.list" in stream_text
-    assert "project.list bajarilmoqda" in stream_text
-    assert "Tool natijasi agentga uzatilmoqda" in stream_text
     assert "event: tool_result" in stream_text
     assert "Kafe bot" in stream_text
     assert "botbuilder.ai_build" not in stream_text

@@ -396,7 +396,6 @@ async def _execute_run(
 
         retry_tool = await store.last_failed_tool(user_id=user_id, thread_id=thread_id)
         if retry_tool and _is_retry_prompt(prompt):
-            await emit_thinking(store, request_id, "Oldingi xatolik topildi, shu amalni qayta sinab ko'raman.")
             first_turn = CompatAgentTurn(
                 text="Oldingi xatolik bo'yicha qayta urinib ko'raman.",
                 tool_calls=[
@@ -408,7 +407,6 @@ async def _execute_run(
                 ],
             )
         else:
-            await emit_thinking(store, request_id, "So'rov tahlil qilinmoqda va kerakli amal tanlanmoqda.")
             first_turn = await run_compat_agent_messages(
                 _initial_agent_messages(
                     prompt,
@@ -435,7 +433,6 @@ async def _execute_run(
 
         tool_call = next((call for call in first_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
         if tool_call is None:
-            await emit_thinking(store, request_id, "Tool kerak emas, javob tayyorlanmoqda.")
             message = first_turn.text or "Tushundim."
             await store.set_status(request_id, "completed", final_response=message)
             final_message = message
@@ -451,11 +448,6 @@ async def _execute_run(
                 "name": TOOL_EVENT_NAMES[tool_call.name],
                 "arguments": tool_call.arguments,
             },
-        )
-        await emit_thinking(
-            store,
-            request_id,
-            f"{TOOL_EVENT_NAMES[tool_call.name]} tooli tanlandi, bajarishga tayyorlanmoqda.",
         )
 
         if tool_call.name != BOTBUILDER_TOOL_NAME:
@@ -492,49 +484,14 @@ async def _execute_run(
             return
 
         tool_prompt = str(tool_call.arguments.get("prompt") or prompt)
-        stream_buffer = ""
-        stream_started = False
-        progress_step = 0
-        progress_messages = [
-            "Bot flow tayyorlanmoqda...\n",
-            "Kerakli node va bog'lanishlar tanlanmoqda...\n",
-            "Bot mantiqi yig'ilmoqda...\n",
-            "Flow tekshiruvga tayyorlanmoqda...\n",
-        ]
 
         async def emit_stream_progress(delta: str) -> None:
-            nonlocal stream_buffer, stream_started, progress_step
-            if not stream_started:
-                stream_started = True
-                await store.add_event(
-                    request_id,
-                    "thinking_delta",
-                    {"delta": progress_messages[progress_step]},
-                )
-                progress_step += 1
-            stream_buffer += delta
-            if len(stream_buffer) < 120:
-                return
-            stream_buffer = ""
-            if progress_step >= len(progress_messages):
-                return
-            await store.add_event(
-                request_id,
-                "thinking_delta",
-                {"delta": progress_messages[progress_step]},
-            )
-            progress_step += 1
+            return None
 
         result = await build_bot_with_ai_stream(
             AIBuildRequest(prompt=tool_prompt, language="uz", max_repair_attempts=2),
             on_delta=emit_stream_progress,
         )
-        if stream_started:
-            await store.add_event(
-                request_id,
-                "thinking_delta",
-                {"delta": "Flow tekshirilmoqda va saqlashga tayyorlanmoqda...\n"},
-            )
         usage.add(input_tokens=result.input_tokens, output_tokens=result.output_tokens)
         flow = result.result.flow.model_dump(mode="json") if result.result.flow else None
         issues = [issue.model_dump(mode="json") for issue in result.result.issues]
@@ -559,7 +516,6 @@ async def _execute_run(
         if result.ok:
             saved_project_id = current_project_id
             if flow and saved_project_id:
-                await emit_thinking(store, request_id, f"Flow project `{saved_project_id}` ga saqlanmoqda.")
                 save_content, save_data, save_error = await save_flow_to_project(
                     settings=settings,
                     auth_claims=auth_claims,
@@ -594,7 +550,6 @@ async def _execute_run(
                     await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
                     terminal_event = ("run_failed", {"error": message})
                     return
-            await emit_thinking(store, request_id, "Tool natijasi umumlashtirilmoqda va yakuniy javob tayyorlanmoqda.")
             final_turn = await run_compat_agent_final(
                 prompt,
                 assistant_text=first_turn.text,
@@ -686,11 +641,6 @@ async def _event_stream(
 
 def _sse_event(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-
-async def emit_thinking(store: CompatRunStore, request_id: str, text: str) -> None:
-    delta = text if text.endswith("\n") else f"{text}\n"
-    await store.add_event(request_id, "thinking_delta", {"delta": delta})
 
 
 async def report_usage_if_needed(
@@ -800,8 +750,6 @@ async def execute_backend_tool_loop(
     last_content = ""
 
     for round_index in range(max_tool_rounds):
-        event_name = TOOL_EVENT_NAMES[current_tool_call.name]
-        await emit_thinking(store, request_id, f"{event_name} bajarilmoqda.")
         tool_content, tool_data, is_error = await execute_backend_tool(
             current_tool_call.name,
             current_tool_call.arguments,
@@ -820,11 +768,6 @@ async def execute_backend_tool_loop(
                 "data": tool_data,
             },
         )
-        await emit_thinking(
-            store,
-            request_id,
-            f"{event_name} natijasi olindi, keyingi qadam tekshirilmoqda.",
-        )
         next_project_id = _project_id_from_tool_result(current_tool_call.name, current_tool_call.arguments, tool_data)
         if next_project_id is not None:
             current_project_id = str(next_project_id)
@@ -841,7 +784,6 @@ async def execute_backend_tool_loop(
             await store.clear_last_failed_tool(user_id=user_id, thread_id=thread_id)
         messages.extend(_tool_exchange_messages(current_turn, current_tool_call, tool_content, tool_data))
 
-        await emit_thinking(store, request_id, "Tool natijasi agentga uzatilmoqda.")
         next_turn = await run_compat_agent_messages(
             messages,
             settings=settings,
@@ -868,11 +810,6 @@ async def execute_backend_tool_loop(
             message = next_turn.text or "Bot flow qurish uchun botbuilder tool tayyor, lekin project tool zanjiri yakunlandi."
             return message, False, 0, 0
 
-        await emit_thinking(
-            store,
-            request_id,
-            f"Keyingi amal tanlandi: {TOOL_EVENT_NAMES[next_tool_call.name]}.",
-        )
         await store.add_event(
             request_id,
             "tool_call",
