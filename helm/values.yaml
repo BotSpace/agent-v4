@@ -2,7 +2,7 @@ replicaCount: 1
 
 image:
   repository: registry.iprogrammer.uz/botspace/agent-v4
-  tag: "3fcc5ab"
+  tag: "de60004"
   pullPolicy: Always
 
 imagePullSecrets:
