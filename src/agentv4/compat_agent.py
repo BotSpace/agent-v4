@@ -7,6 +7,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from .ai import AIConfigurationError
 from .config import Settings, get_settings
 from .openai_payload import add_completion_token_limit
@@ -80,6 +82,18 @@ class CompatAgentTurn:
     output_tokens: int = 0
 
 
+class CompatPlanItem(BaseModel):
+    id: str = Field(min_length=1, max_length=64)
+    title: str = Field(min_length=3, max_length=120)
+    status: str = Field(default="pending")
+    notes: str | None = Field(default=None, max_length=240)
+
+
+class CompatPlanResponse(BaseModel):
+    summary: str | None = Field(default=None, max_length=240)
+    items: list[CompatPlanItem] = Field(default_factory=list, min_length=3, max_length=3)
+
+
 async def run_compat_agent_turn(prompt: str, *, settings: Settings | None = None) -> CompatAgentTurn:
     s = settings or get_settings()
     return await _call_chat_completions(
@@ -144,6 +158,41 @@ async def run_compat_agent_final(
     return await _call_chat_completions(settings=s, messages=messages)
 
 
+async def run_compat_agent_plan(
+    prompt: str,
+    *,
+    selected_tool: str | None = None,
+    assistant_text: str | None = None,
+    settings: Settings | None = None,
+) -> CompatPlanResponse:
+    s = settings or get_settings()
+    payload = await _call_chat_json(
+        settings=s,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You write short execution plans for Botmother AgentV4. "
+                    "Return strict JSON only with keys `summary` and `items`. "
+                    "Create exactly 3 items. Each item must have `id`, `title`, `status`, `notes`. "
+                    "`status` must be `pending`. `summary` and `notes` must be user-facing, concise, "
+                    "and in the user's language. Keep titles action-oriented and concrete."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"User request: {prompt}\n"
+                    f"Selected tool: {selected_tool or 'direct_reply'}\n"
+                    f"Initial assistant intent: {assistant_text or ''}\n"
+                    "Plan should match this flow: understand/prepare -> execute main work -> verify/summarize."
+                ),
+            },
+        ],
+    )
+    return CompatPlanResponse.model_validate(payload)
+
+
 async def _call_chat_completions(
     *,
     settings: Settings,
@@ -161,6 +210,24 @@ async def _call_chat_completions(
             messages=messages,
             tools=tools,
             tool_choice=tool_choice,
+        ),
+        timeout=settings.openai_timeout + 5,
+    )
+
+
+async def _call_chat_json(
+    *,
+    settings: Settings,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    if not settings.openai_api_key:
+        raise AIConfigurationError("OPENAI_API_KEY is not configured")
+
+    return await asyncio.wait_for(
+        asyncio.to_thread(
+            _call_chat_json_sync,
+            settings=settings,
+            messages=messages,
         ),
         timeout=settings.openai_timeout + 5,
     )
@@ -208,6 +275,45 @@ def _call_chat_completions_sync(
         input_tokens=int((usage or {}).get("prompt_tokens") or 0),
         output_tokens=int((usage or {}).get("completion_tokens") or 0),
     )
+
+
+def _call_chat_json_sync(
+    *,
+    settings: Settings,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "model": settings.openai_model,
+        "messages": messages,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+    add_completion_token_limit(payload, model=settings.openai_model, max_tokens=settings.openai_max_tokens)
+
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.openai_api_key}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=settings.openai_timeout) as res:
+            body = json.loads(res.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise ValueError(f"OpenAI HTTP {exc.code}: {detail}") from exc
+
+    message = body["choices"][0]["message"]
+    content = message.get("content") or "{}"
+    if not isinstance(content, str):
+        raise ValueError("Planner response content is not a string")
+    parsed = json.loads(content)
+    if not isinstance(parsed, dict):
+        raise ValueError("Planner response must be a JSON object")
+    return parsed
 
 
 def parse_tool_calls(raw_calls: list[Any]) -> list[CompatToolCall]:
@@ -453,6 +559,8 @@ Work like a coding agent with tools:
   without choosing a project, list projects or ask the user to choose.
 - For destructive tools (delete, deploy, broadcast_send), call them only after the user clearly asks or confirms.
 - Do not call tools for casual chat.
+- For any non-trivial task that uses tools, first think in a short plan of 3-4 steps and then work step-by-step.
+- When you move to a new major stage, briefly explain what you are doing in 1 sentence.
 - After a tool result, explain briefly what happened and point to the returned flow data when relevant.
 - Reply in the user's language. Uzbek Latin is preferred when the user writes Uzbek.
 """.strip()

@@ -25,7 +25,7 @@ from ..compat_agent import (
     TOOL_EVENT_NAMES,
     compat_system_prompt,
 )
-from ..compat_agent import run_compat_agent_final, run_compat_agent_messages
+from ..compat_agent import run_compat_agent_final, run_compat_agent_messages, run_compat_agent_plan
 from ..config import Settings
 from ..limits import require_available_ai_tokens
 from .auth import CurrentUser, get_current_user
@@ -76,6 +76,91 @@ class TokenUsageAccumulator:
         return bool(self.input_tokens or self.output_tokens)
 
 
+class PlanTracker:
+    def __init__(self, *, store: RunStore, request_id: str) -> None:
+        self._store = store
+        self._request_id = request_id
+        self.plan: list[dict[str, Any]] = []
+        self.active_index: int | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.plan)
+
+    async def initialize(
+        self,
+        *,
+        prompt: str,
+        tool_name: str | None,
+        assistant_text: str | None,
+        settings: Settings,
+    ) -> None:
+        if not _should_create_plan(prompt, tool_name):
+            return
+        try:
+            response = await run_compat_agent_plan(
+                prompt,
+                selected_tool=tool_name,
+                assistant_text=assistant_text,
+                settings=settings,
+            )
+        except Exception:
+            return
+        self.plan = [_normalize_plan_item(item.model_dump(mode="json"), index=i) for i, item in enumerate(response.items)]
+        await self._store.set_current_plan(self._request_id, self.plan)
+        await self._store.add_event(self._request_id, "plan_set", {"plan": self.plan})
+        if response.summary:
+            await self._store.add_event(
+                self._request_id,
+                "assistant_message",
+                {"text": response.summary, "usage": {}},
+            )
+
+    async def start(self, index: int) -> None:
+        if not self.enabled or index >= len(self.plan):
+            return
+        self.active_index = index
+        self.plan[index]["status"] = "in_progress"
+        await self._persist("plan_update", index)
+        note = str(self.plan[index].get("notes") or "").strip()
+        if note:
+            await self._store.add_event(
+                self._request_id,
+                "assistant_message",
+                {"text": note, "usage": {}},
+            )
+
+    async def complete(self, index: int | None = None) -> None:
+        if not self.enabled:
+            return
+        target = self.active_index if index is None else index
+        if target is None or target >= len(self.plan):
+            return
+        self.plan[target]["status"] = "completed"
+        await self._persist("plan_update", target)
+        if self.active_index == target:
+            self.active_index = None
+
+    async def block_active(self, note: str | None = None) -> None:
+        if not self.enabled:
+            return
+        if self.active_index is None or self.active_index >= len(self.plan):
+            return
+        self.plan[self.active_index]["status"] = "blocked"
+        if note:
+            self.plan[self.active_index]["notes"] = note
+        await self._persist("plan_update", self.active_index)
+        self.active_index = None
+
+    async def _persist(self, event_name: str, index: int) -> None:
+        await self._store.set_current_plan(self._request_id, self.plan)
+        await self._store.add_event(
+            self._request_id,
+            event_name,
+            {"item": dict(self.plan[index]), "plan": self.plan},
+        )
+
+
 def create_compat_router(store: RunStore, *, settings: Settings) -> APIRouter:
     router = APIRouter()
 
@@ -93,8 +178,6 @@ def create_compat_router(store: RunStore, *, settings: Settings) -> APIRouter:
             thread_id=body.thread_id,
             auth_claims=user.claims,
         )
-        task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt, settings=settings))
-        store.register_task(run.request_id, task)
         return RunCreateResponse(request_id=run.request_id, status="queued")
 
     @router.get("/projects/{project_id}/runs/{request_id}", response_model=RunStatusResponse)
@@ -124,6 +207,10 @@ def create_compat_router(store: RunStore, *, settings: Settings) -> APIRouter:
         run = await store.get(request_id, project_id=project_id, user_id=user.user_id)
         if run is None:
             raise HTTPException(status_code=404, detail="Run not found")
+        if run.status == "queued":
+            await store.set_status(request_id, "starting")
+            task = asyncio.create_task(_execute_run(store, request_id, run.prompt, settings=settings))
+            store.register_task(request_id, task)
         return StreamingResponse(
             _event_stream(store, request_id, since_seq=since_seq),
             media_type="text/event-stream",
@@ -183,6 +270,7 @@ async def _execute_run(
     thread_id: str | None = None
     usage = TokenUsageAccumulator()
     terminal_event: tuple[str, dict[str, Any]] | None = None
+    plan = PlanTracker(store=store, request_id=request_id)
     try:
         run = await store.get_execution_context(request_id)
         project_id = run.project_id if run else None
@@ -222,6 +310,16 @@ async def _execute_run(
             )
         usage.add(input_tokens=first_turn.input_tokens, output_tokens=first_turn.output_tokens)
         await _raise_if_cancel_requested(store, request_id)
+        tool_call = next((call for call in first_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
+        await plan.initialize(
+            prompt=prompt,
+            tool_name=tool_call.name if tool_call else None,
+            assistant_text=first_turn.text,
+            settings=settings,
+        )
+        if plan.enabled:
+            await plan.start(0)
+            await plan.complete(0)
         if first_turn.text:
             await store.add_event(
                 request_id,
@@ -234,9 +332,10 @@ async def _execute_run(
                     },
                 },
             )
-
-        tool_call = next((call for call in first_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
         if tool_call is None:
+            if plan.enabled:
+                await plan.start(2)
+                await plan.complete(2)
             message = first_turn.text or "Tushundim."
             await store.set_status(request_id, "completed", final_response=message)
             final_message = message
@@ -251,10 +350,13 @@ async def _execute_run(
                 "id": tool_call.id,
                 "name": TOOL_EVENT_NAMES[tool_call.name],
                 "arguments": tool_call.arguments,
+                "hidden": tool_call.name == BOTBUILDER_TOOL_NAME,
             },
         )
 
         if tool_call.name != BOTBUILDER_TOOL_NAME:
+            if plan.enabled:
+                await plan.start(1)
             message, is_error, _loop_input, _loop_output = await execute_backend_tool_loop(
                 store,
                 request_id,
@@ -272,7 +374,14 @@ async def _execute_run(
                 user_id=user_id,
                 thread_id=thread_id,
                 usage=usage,
+                plan=plan,
             )
+            if plan.enabled and not is_error:
+                await plan.complete(1)
+                await plan.start(2)
+                await plan.complete(2)
+            elif is_error:
+                await plan.block_active(message)
             await store.set_status(
                 request_id,
                 "failed" if is_error else "completed",
@@ -292,6 +401,8 @@ async def _execute_run(
         async def emit_stream_progress(delta: str) -> None:
             return None
 
+        if plan.enabled:
+            await plan.start(1)
         result = await build_bot_with_ai_stream(
             AIBuildRequest(prompt=tool_prompt, language="uz", max_repair_attempts=2),
             on_delta=emit_stream_progress,
@@ -316,11 +427,15 @@ async def _execute_run(
                 "content": tool_content,
                 "is_error": not result.ok,
                 "data": tool_data,
+                "hidden": True,
             },
         )
         if result.ok:
+            await plan.complete(1)
             saved_project_id = current_project_id
             if flow and saved_project_id:
+                if plan.enabled:
+                    await plan.start(2)
                 save_content, save_data, save_error = await save_flow_to_project(
                     settings=settings,
                     auth_claims=auth_claims,
@@ -334,6 +449,7 @@ async def _execute_run(
                         "id": f"{tool_call.id}:project_update",
                         "name": TOOL_EVENT_NAMES[PROJECT_UPDATE_TOOL_NAME],
                         "arguments": {"id": saved_project_id, "flow": "<compiled_flow>"},
+                        "hidden": True,
                     },
                 )
                 await store.add_event(
@@ -344,17 +460,23 @@ async def _execute_run(
                         "content": save_content,
                         "is_error": save_error,
                         "data": save_data,
+                        "hidden": True,
                     },
                 )
                 tool_data["saved_project_id"] = saved_project_id
                 tool_data["save"] = save_data
                 if save_error:
+                    await plan.block_active(save_content)
                     message = f"Flow compile bo'ldi, lekin project `{saved_project_id}` ga saqlanmadi: {save_content}"
                     await store.set_status(request_id, "failed", error=message)
                     final_message = message
                     await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
                     terminal_event = ("run_failed", {"error": message})
                     return
+                await plan.complete(2)
+            elif plan.enabled:
+                await plan.start(2)
+                await plan.complete(2)
             final_turn = await run_compat_agent_final(
                 prompt,
                 assistant_text=first_turn.text,
@@ -383,16 +505,19 @@ async def _execute_run(
             terminal_event = ("run_completed", {"request_id": request_id})
         else:
             message = "Bot flow to'liq compile bo'lmadi. Issues: " + ", ".join(issue["code"] for issue in issues)
+            await plan.block_active(message)
             await store.set_status(request_id, "failed", error=message)
             final_message = message
             await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
             terminal_event = ("run_failed", {"error": message})
     except asyncio.CancelledError:
+        await plan.block_active("Run cancelled")
         await store.set_status(request_id, "cancelled", error="Run cancelled")
         terminal_event = ("run_failed", {"error": "Run cancelled"})
         raise
     except Exception as exc:
         message = str(exc)
+        await plan.block_active(message)
         await store.set_status(request_id, "failed", error=message)
         terminal_event = ("run_failed", {"error": message})
     finally:
@@ -562,8 +687,10 @@ async def execute_backend_tool_loop(
     user_id: str,
     thread_id: str | None,
     usage: TokenUsageAccumulator,
+    plan: PlanTracker,
     max_tool_rounds: int = 6,
 ) -> tuple[str, bool, int, int]:
+    _ = plan
     messages = list(base_messages)
     current_turn = first_turn
     current_tool_call = first_tool_call
@@ -714,6 +841,45 @@ def _project_id_from_tool_result(
             return project.get("id") or arguments.get("id")
         return arguments.get("id")
     return None
+
+
+def _should_create_plan(prompt: str, tool_name: str | None) -> bool:
+    if tool_name is None:
+        return False
+    normalized = prompt.strip().lower()
+    if len(normalized) >= 40:
+        return True
+    keywords = (
+        "yarat",
+        "qur",
+        "tuz",
+        "deploy",
+        "loyiha",
+        "cms",
+        "collection",
+        "bot",
+        "flow",
+        "ulash",
+        "sozla",
+        "yangila",
+        "o'zgartir",
+        "edit",
+        "configure",
+        "build",
+    )
+    return any(keyword in normalized for keyword in keywords)
+
+
+def _normalize_plan_item(item: dict[str, Any], *, index: int) -> dict[str, Any]:
+    title = str(item.get("title") or f"Bosqich {index + 1}").strip() or f"Bosqich {index + 1}"
+    notes = str(item.get("notes") or "").strip() or None
+    item_id = str(item.get("id") or f"step_{index + 1}")
+    return {
+        "id": item_id,
+        "title": title,
+        "status": "pending",
+        "notes": notes,
+    }
 
 
 async def execute_backend_tool(

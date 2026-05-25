@@ -6,7 +6,13 @@ from agentv4.ai import AIBuildResponse
 from agentv4.backend import get_backend_client
 from agentv4.builder.commands import CreateBotCommand, AddTextCommand
 from agentv4.builder.session import build_from_commands
-from agentv4.compat_agent import BOTBUILDER_TOOL_NAME, PROJECT_LIST_TOOL_NAME, CompatAgentTurn, CompatToolCall
+from agentv4.compat_agent import (
+    BOTBUILDER_TOOL_NAME,
+    PROJECT_LIST_TOOL_NAME,
+    CompatAgentTurn,
+    CompatPlanResponse,
+    CompatToolCall,
+)
 from agentv4.config import get_settings
 
 
@@ -248,6 +254,91 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
     assert "Bot flow tayyor" in status.json()["final_response"]
 
 
+def test_agentv4_complex_run_emits_plan_and_persists_completed_status(monkeypatch) -> None:
+    class FakeBackend:
+        async def update_project(self, project_id, body, *, auth_claims=None):
+            return {"id": project_id, **body}
+
+    async def fake_agent_turn(_messages, *, settings=None, allow_tools=True):
+        return CompatAgentTurn(
+            text="Avval asosiy bo'limlarni tayyorlayman.",
+            tool_calls=[
+                CompatToolCall(
+                    id="tool-call-plan",
+                    name=BOTBUILDER_TOOL_NAME,
+                    arguments={"prompt": "O'quv markaz uchun bot qilib ber"},
+                )
+            ],
+            input_tokens=5,
+            output_tokens=7,
+        )
+
+    async def fake_agent_final(*_args, **_kwargs):
+        return CompatAgentTurn(
+            text="Bot tayyor va loyihaga saqlandi.",
+            input_tokens=3,
+            output_tokens=4,
+        )
+
+    async def fake_plan(*_args, **_kwargs):
+        return CompatPlanResponse.model_validate(
+            {
+                "summary": "Avval reja tuzaman, keyin flowni yig'ib saqlayman.",
+                "items": [
+                    {"id": "step_1", "title": "Talabni aniqlash", "status": "pending", "notes": "Talablarni qisqa rejalab olaman."},
+                    {"id": "step_2", "title": "Flowni qurish", "status": "pending", "notes": "Endi asosiy flowni quraman."},
+                    {"id": "step_3", "title": "Tekshirish va saqlash", "status": "pending", "notes": "Oxirida natijani tekshirib saqlayman."},
+                ],
+            }
+        )
+
+    async def fake_build_bot_with_ai_stream(request, *, on_delta=None):
+        commands = [
+            CreateBotCommand(action="create_bot", name="Compat bot", language="uz"),
+            AddTextCommand(action="add_text", key="welcome", text=request.prompt, after="start"),
+        ]
+        result = build_from_commands(commands)
+        return AIBuildResponse(
+            ok=True,
+            model="fake",
+            attempts=1,
+            commands=[command.model_dump(mode="json") for command in commands],
+            result=result,
+        )
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_final", fake_agent_final)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_plan", fake_plan)
+    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fake_build_bot_with_ai_stream)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "O'quv markaz uchun bot qilib ber", "thread_id": "plan_thread"},
+    )
+    assert created.status_code == 200
+    request_id = created.json()["request_id"]
+
+    with client.stream("GET", f"/projects/project_1/runs/{request_id}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "event: plan_set" in stream_text
+    assert "event: plan_update" in stream_text
+    assert "in_progress" in stream_text
+    assert "completed" in stream_text
+    assert "Avval reja tuzaman" in stream_text
+    assert "Endi asosiy flowni quraman" in stream_text
+
+    status = client.get(f"/projects/project_1/runs/{request_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
+    current_plan = status.json()["current_plan"]
+    assert isinstance(current_plan, list)
+    assert all(item["status"] == "completed" for item in current_plan)
+
+
 def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
     async def fake_agent_turn(_messages, *, settings=None, allow_tools=True):
         return CompatAgentTurn(
@@ -275,6 +366,7 @@ def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
         stream_text = "".join(response.iter_text())
 
     assert "event: assistant_message" in stream_text
+    assert "event: plan_set" not in stream_text
     assert "botbuilder.ai_build" not in stream_text
     assert "Men Botmother AgentV4man" in stream_text
 

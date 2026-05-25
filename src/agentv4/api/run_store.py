@@ -84,6 +84,8 @@ class RunStore(Protocol):
         error: str | None = None,
     ) -> None: ...
 
+    async def set_current_plan(self, request_id: str, plan: list[dict[str, Any]] | None) -> None: ...
+
     async def add_event(self, request_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]: ...
 
     async def list_events(self, request_id: str, *, since_seq: int = 0) -> list[dict[str, Any]]: ...
@@ -227,6 +229,13 @@ class InMemoryRunStore:
                 run.final_response = final_response
             if error is not None:
                 run.error = error
+
+    async def set_current_plan(self, request_id: str, plan: list[dict[str, Any]] | None) -> None:
+        async with self._lock:
+            run = self._runs.get(request_id)
+            if run is None:
+                return
+            run.current_plan = list(plan or []) or None
 
     async def add_event(self, request_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         async with self._lock:
@@ -437,6 +446,13 @@ class RedisRunStore:
         if error is not None:
             mapping["error"] = error
         await self._redis.hset(self._run_key(request_id), mapping=mapping)
+        await self._expire_run_keys(request_id)
+
+    async def set_current_plan(self, request_id: str, plan: list[dict[str, Any]] | None) -> None:
+        await self._redis.hset(
+            self._run_key(request_id),
+            mapping={"current_plan": json.dumps(plan or [], ensure_ascii=False)},
+        )
         await self._expire_run_keys(request_id)
 
     async def add_event(self, request_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
