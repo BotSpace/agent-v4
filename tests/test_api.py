@@ -105,6 +105,57 @@ def test_usage_compat_endpoint() -> None:
     assert {"limit", "used", "remaining", "input_used", "output_used"}.issubset(body)
 
 
+def test_default_agent_model_is_gpt_5_2(monkeypatch) -> None:
+    monkeypatch.delenv("AGENTV4_OPENAI_MODEL", raising=False)
+    get_settings.cache_clear()
+
+    assert get_settings().openai_model == "gpt-5.2"
+
+
+def test_compat_run_reports_usage_once_and_emits_update(monkeypatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeBackend:
+        async def report_token_usage(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "usage": {
+                    "used": 12,
+                    "limit": 100,
+                    "remaining": 88,
+                    "input_used": 5,
+                    "output_used": 7,
+                    "token_reset_at": None,
+                }
+            }
+
+    async def fake_agent_turn(_messages, *, settings=None, allow_tools=True):
+        return CompatAgentTurn(text="Salom!", input_tokens=5, output_tokens=7)
+
+    monkeypatch.setenv("AGENTV4_REPORT_TOKEN_USAGE", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "salom", "thread_id": "usage_thread"},
+    )
+    assert created.status_code == 200
+    request_id = created.json()["request_id"]
+
+    with client.stream("GET", f"/projects/project_1/runs/{request_id}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert len(calls) == 1
+    assert calls[0]["input_tokens"] == 5
+    assert calls[0]["output_tokens"] == 7
+    assert "event: usage_updated" in stream_text
+    assert stream_text.index("event: usage_updated") < stream_text.index("event: run_completed")
+
+
 def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
     class FakeBackend:
         async def update_project(self, project_id, body, *, auth_claims=None):
@@ -206,6 +257,8 @@ def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
         stream_text = "".join(response.iter_text())
 
     assert "event: assistant_message" in stream_text
+    assert "So'rov tahlil qilinmoqda" in stream_text
+    assert "Tool kerak emas, javob tayyorlanmoqda" in stream_text
     assert "botbuilder.ai_build" not in stream_text
     assert "Men Botmother AgentV4man" in stream_text
 
@@ -268,6 +321,8 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
 
     assert "event: tool_call" in stream_text
     assert "project.list" in stream_text
+    assert "project.list bajarilmoqda" in stream_text
+    assert "Tool natijasi agentga uzatilmoqda" in stream_text
     assert "event: tool_result" in stream_text
     assert "Kafe bot" in stream_text
     assert "botbuilder.ai_build" not in stream_text

@@ -17,7 +17,7 @@ class Settings:
         self.port = int(os.getenv("AGENTV4_PORT", "8094"))
 
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.openai_model = os.getenv("AGENTV4_OPENAI_MODEL", "gpt-4o-mini")
+        self.openai_model = os.getenv("AGENTV4_OPENAI_MODEL", "gpt-5.2")
         self.openai_timeout = float(os.getenv("AGENTV4_OPENAI_TIMEOUT", "45"))
         self.openai_max_tokens = int(os.getenv("AGENTV4_OPENAI_MAX_TOKENS", "1800"))
 

@@ -79,6 +79,20 @@ class CompatRun:
     task: asyncio.Task[None] | None = None
 
 
+@dataclass
+class TokenUsageAccumulator:
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    def add(self, *, input_tokens: int = 0, output_tokens: int = 0) -> None:
+        self.input_tokens += int(input_tokens or 0)
+        self.output_tokens += int(output_tokens or 0)
+
+    @property
+    def has_usage(self) -> bool:
+        return bool(self.input_tokens or self.output_tokens)
+
+
 class CompatRunStore:
     def __init__(self) -> None:
         self._runs: dict[str, CompatRun] = {}
@@ -362,7 +376,10 @@ async def _execute_run(
     final_message: str | None = None
     completed_successfully = False
     user_id = ""
+    project_id: str | None = None
     thread_id: str | None = None
+    usage = TokenUsageAccumulator()
+    terminal_event: tuple[str, dict[str, Any]] | None = None
     try:
         async with store._lock:
             run = store._runs.get(request_id)
@@ -379,6 +396,7 @@ async def _execute_run(
 
         retry_tool = await store.last_failed_tool(user_id=user_id, thread_id=thread_id)
         if retry_tool and _is_retry_prompt(prompt):
+            await emit_thinking(store, request_id, "Oldingi xatolik topildi, shu amalni qayta sinab ko'raman.")
             first_turn = CompatAgentTurn(
                 text="Oldingi xatolik bo'yicha qayta urinib ko'raman.",
                 tool_calls=[
@@ -390,6 +408,7 @@ async def _execute_run(
                 ],
             )
         else:
+            await emit_thinking(store, request_id, "So'rov tahlil qilinmoqda va kerakli amal tanlanmoqda.")
             first_turn = await run_compat_agent_messages(
                 _initial_agent_messages(
                     prompt,
@@ -400,8 +419,7 @@ async def _execute_run(
                 settings=settings,
                 allow_tools=True,
             )
-        total_input_tokens = first_turn.input_tokens
-        total_output_tokens = first_turn.output_tokens
+        usage.add(input_tokens=first_turn.input_tokens, output_tokens=first_turn.output_tokens)
         if first_turn.text:
             await store.add_event(
                 request_id,
@@ -417,18 +435,12 @@ async def _execute_run(
 
         tool_call = next((call for call in first_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
         if tool_call is None:
+            await emit_thinking(store, request_id, "Tool kerak emas, javob tayyorlanmoqda.")
             message = first_turn.text or "Tushundim."
             await store.set_status(request_id, "completed", final_response=message)
             final_message = message
             completed_successfully = True
-            await report_usage_if_needed(
-                settings=settings,
-                user_id=user_id,
-                project_id=project_id,
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-            )
-            await store.add_event(request_id, "run_completed", {"request_id": request_id})
+            terminal_event = ("run_completed", {"request_id": request_id})
             return
 
         await store.add_event(
@@ -440,9 +452,14 @@ async def _execute_run(
                 "arguments": tool_call.arguments,
             },
         )
+        await emit_thinking(
+            store,
+            request_id,
+            f"{TOOL_EVENT_NAMES[tool_call.name]} tooli tanlandi, bajarishga tayyorlanmoqda.",
+        )
 
         if tool_call.name != BOTBUILDER_TOOL_NAME:
-            message, is_error, loop_input, loop_output = await execute_backend_tool_loop(
+            message, is_error, _loop_input, _loop_output = await execute_backend_tool_loop(
                 store,
                 request_id,
                 first_turn=first_turn,
@@ -458,9 +475,8 @@ async def _execute_run(
                 ),
                 user_id=user_id,
                 thread_id=thread_id,
+                usage=usage,
             )
-            total_input_tokens += loop_input
-            total_output_tokens += loop_output
             await store.set_status(
                 request_id,
                 "failed" if is_error else "completed",
@@ -469,15 +485,7 @@ async def _execute_run(
             )
             final_message = message
             completed_successfully = not is_error
-            await report_usage_if_needed(
-                settings=settings,
-                user_id=user_id,
-                project_id=project_id,
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-            )
-            await store.add_event(
-                request_id,
+            terminal_event = (
                 "run_failed" if is_error else "run_completed",
                 {"error": message} if is_error else {"request_id": request_id},
             )
@@ -527,8 +535,7 @@ async def _execute_run(
                 "thinking_delta",
                 {"delta": "Flow tekshirilmoqda va saqlashga tayyorlanmoqda...\n"},
             )
-        total_input_tokens += result.input_tokens
-        total_output_tokens += result.output_tokens
+        usage.add(input_tokens=result.input_tokens, output_tokens=result.output_tokens)
         flow = result.result.flow.model_dump(mode="json") if result.result.flow else None
         issues = [issue.model_dump(mode="json") for issue in result.result.issues]
         tool_content = "Flow compiled" if result.ok else "Flow validation failed"
@@ -552,6 +559,7 @@ async def _execute_run(
         if result.ok:
             saved_project_id = current_project_id
             if flow and saved_project_id:
+                await emit_thinking(store, request_id, f"Flow project `{saved_project_id}` ga saqlanmoqda.")
                 save_content, save_data, save_error = await save_flow_to_project(
                     settings=settings,
                     auth_claims=auth_claims,
@@ -584,8 +592,9 @@ async def _execute_run(
                     await store.set_status(request_id, "failed", error=message)
                     final_message = message
                     await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
-                    await store.add_event(request_id, "run_failed", {"error": message})
+                    terminal_event = ("run_failed", {"error": message})
                     return
+            await emit_thinking(store, request_id, "Tool natijasi umumlashtirilmoqda va yakuniy javob tayyorlanmoqda.")
             final_turn = await run_compat_agent_final(
                 prompt,
                 assistant_text=first_turn.text,
@@ -594,8 +603,7 @@ async def _execute_run(
                 tool_data=tool_data,
                 settings=settings,
             )
-            total_input_tokens += final_turn.input_tokens
-            total_output_tokens += final_turn.output_tokens
+            usage.add(input_tokens=final_turn.input_tokens, output_tokens=final_turn.output_tokens)
             message = final_turn.text or "Flow tayyor. Natija `tool_result.data.flow` ichida."
             await store.set_status(request_id, "completed", final_response=message)
             final_message = message
@@ -611,28 +619,40 @@ async def _execute_run(
                     },
                 },
             )
-            await report_usage_if_needed(
-                settings=settings,
-                user_id=user_id,
-                project_id=project_id,
-                input_tokens=total_input_tokens,
-                output_tokens=total_output_tokens,
-            )
-            await store.add_event(request_id, "run_completed", {"request_id": request_id})
+            terminal_event = ("run_completed", {"request_id": request_id})
         else:
             message = "Bot flow to'liq compile bo'lmadi. Issues: " + ", ".join(issue["code"] for issue in issues)
             await store.set_status(request_id, "failed", error=message)
             final_message = message
             await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
-            await store.add_event(request_id, "run_failed", {"error": message})
+            terminal_event = ("run_failed", {"error": message})
     except asyncio.CancelledError:
         await store.set_status(request_id, "cancelled", error="Run cancelled")
         raise
     except Exception as exc:
         message = str(exc)
         await store.set_status(request_id, "failed", error=message)
-        await store.add_event(request_id, "run_failed", {"error": message})
+        terminal_event = ("run_failed", {"error": message})
     finally:
+        usage_snapshot = await report_usage_if_needed(
+            settings=settings,
+            user_id=user_id,
+            project_id=project_id,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+        )
+        if usage_snapshot is not None:
+            await store.add_event(
+                request_id,
+                "usage_updated",
+                {
+                    **usage_snapshot,
+                    "input_tokens_added": usage.input_tokens,
+                    "output_tokens_added": usage.output_tokens,
+                },
+            )
+        if terminal_event is not None:
+            await store.add_event(request_id, terminal_event[0], terminal_event[1])
         if completed_successfully and final_message:
             await store.append_thread_message(user_id=user_id, thread_id=thread_id, role="assistant", content=final_message)
         await store.finish_streams(request_id)
@@ -668,6 +688,11 @@ def _sse_event(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
+async def emit_thinking(store: CompatRunStore, request_id: str, text: str) -> None:
+    delta = text if text.endswith("\n") else f"{text}\n"
+    await store.add_event(request_id, "thinking_delta", {"delta": delta})
+
+
 async def report_usage_if_needed(
     *,
     settings: Settings,
@@ -675,19 +700,23 @@ async def report_usage_if_needed(
     project_id: str | None,
     input_tokens: int,
     output_tokens: int,
-) -> None:
+) -> dict[str, Any] | None:
     if not settings.report_token_usage or not (input_tokens or output_tokens):
-        return
+        return None
     try:
         backend = get_backend_client(settings)
-        await backend.report_token_usage(
+        payload = await backend.report_token_usage(
             user_id=user_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             project_id=project_id,
         )
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        if isinstance(usage, dict):
+            return usage
+        return payload if isinstance(payload, dict) else None
     except Exception:
-        pass
+        return None
 
 
 def _initial_agent_messages(
@@ -762,16 +791,17 @@ async def execute_backend_tool_loop(
     base_messages: list[dict[str, Any]],
     user_id: str,
     thread_id: str | None,
+    usage: TokenUsageAccumulator,
     max_tool_rounds: int = 6,
 ) -> tuple[str, bool, int, int]:
     messages = list(base_messages)
     current_turn = first_turn
     current_tool_call = first_tool_call
-    input_tokens = 0
-    output_tokens = 0
     last_content = ""
 
     for round_index in range(max_tool_rounds):
+        event_name = TOOL_EVENT_NAMES[current_tool_call.name]
+        await emit_thinking(store, request_id, f"{event_name} bajarilmoqda.")
         tool_content, tool_data, is_error = await execute_backend_tool(
             current_tool_call.name,
             current_tool_call.arguments,
@@ -790,6 +820,11 @@ async def execute_backend_tool_loop(
                 "data": tool_data,
             },
         )
+        await emit_thinking(
+            store,
+            request_id,
+            f"{event_name} natijasi olindi, keyingi qadam tekshirilmoqda.",
+        )
         next_project_id = _project_id_from_tool_result(current_tool_call.name, current_tool_call.arguments, tool_data)
         if next_project_id is not None:
             current_project_id = str(next_project_id)
@@ -806,13 +841,13 @@ async def execute_backend_tool_loop(
             await store.clear_last_failed_tool(user_id=user_id, thread_id=thread_id)
         messages.extend(_tool_exchange_messages(current_turn, current_tool_call, tool_content, tool_data))
 
+        await emit_thinking(store, request_id, "Tool natijasi agentga uzatilmoqda.")
         next_turn = await run_compat_agent_messages(
             messages,
             settings=settings,
             allow_tools=not is_error and round_index + 1 < max_tool_rounds,
         )
-        input_tokens += next_turn.input_tokens
-        output_tokens += next_turn.output_tokens
+        usage.add(input_tokens=next_turn.input_tokens, output_tokens=next_turn.output_tokens)
         if next_turn.text:
             await store.add_event(
                 request_id,
@@ -828,11 +863,16 @@ async def execute_backend_tool_loop(
 
         next_tool_call = next((call for call in next_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
         if is_error or next_tool_call is None:
-            return next_turn.text or tool_content, is_error, input_tokens, output_tokens
+            return next_turn.text or tool_content, is_error, 0, 0
         if next_tool_call.name == BOTBUILDER_TOOL_NAME:
             message = next_turn.text or "Bot flow qurish uchun botbuilder tool tayyor, lekin project tool zanjiri yakunlandi."
-            return message, False, input_tokens, output_tokens
+            return message, False, 0, 0
 
+        await emit_thinking(
+            store,
+            request_id,
+            f"Keyingi amal tanlandi: {TOOL_EVENT_NAMES[next_tool_call.name]}.",
+        )
         await store.add_event(
             request_id,
             "tool_call",
@@ -845,7 +885,7 @@ async def execute_backend_tool_loop(
         current_turn = next_turn
         current_tool_call = next_tool_call
 
-    return last_content or "Tool limit reached.", False, input_tokens, output_tokens
+    return last_content or "Tool limit reached.", False, 0, 0
 
 
 def _tool_exchange_messages(

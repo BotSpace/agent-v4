@@ -559,7 +559,7 @@ class BackendClient:
         input_tokens: int,
         output_tokens: int,
         project_id: str | None = None,
-    ) -> None:
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {
             "user_id": int(user_id),
             "input_tokens": input_tokens,
@@ -567,7 +567,8 @@ class BackendClient:
         }
         if project_id:
             body["project_id"] = project_id
-        await self._request("POST", "/api/subscription/usage/report/", json=body)
+        payload = await self._request("POST", "/api/subscription/usage/report/", json=body)
+        return _unwrap_item(payload)
 
 
 @lru_cache(maxsize=1)
