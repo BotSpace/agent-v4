@@ -68,7 +68,6 @@ def create_app() -> FastAPI:
         ]
 
     @app.get("/usage")
-    @app.get("/agent/v4/usage")
     async def usage() -> dict[str, object]:
         return {
             "user_id": "compat",
@@ -126,6 +125,5 @@ def create_app() -> FastAPI:
 
     compat_router = create_compat_router(compat_store)
     app.include_router(compat_router)
-    app.include_router(compat_router, prefix="/agent/v4")
 
     return app

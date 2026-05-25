@@ -128,38 +128,3 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
     assert status.status_code == 200
     assert status.json()["status"] == "completed"
     assert "Bot flow tayyor" in status.json()["final_response"]
-
-
-def test_agentv4_versioned_compat_run_lifecycle(monkeypatch) -> None:
-    async def fake_build_bot_with_ai(request):
-        commands = [
-            CreateBotCommand(action="create_bot", name="Compat bot", language="uz"),
-            AddTextCommand(action="add_text", key="welcome", text=request.prompt, after="start"),
-        ]
-        result = build_from_commands(commands)
-        return AIBuildResponse(
-            ok=True,
-            model="fake",
-            attempts=1,
-            commands=[command.model_dump(mode="json") for command in commands],
-            result=result,
-        )
-
-    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai", fake_build_bot_with_ai)
-    client = TestClient(create_app())
-
-    created = client.post(
-        "/agent/v4/projects/project_1/runs",
-        json={"prompt": "Kafe bot yarat", "thread_id": "thread_1"},
-    )
-    assert created.status_code == 200
-    request_id = created.json()["request_id"]
-
-    with client.stream("GET", f"/agent/v4/projects/project_1/runs/{request_id}/events") as response:
-        assert response.status_code == 200
-        stream_text = "".join(response.iter_text())
-
-    assert "event: run_completed" in stream_text
-    status = client.get(f"/agent/v4/projects/project_1/runs/{request_id}")
-    assert status.status_code == 200
-    assert status.json()["status"] == "completed"
