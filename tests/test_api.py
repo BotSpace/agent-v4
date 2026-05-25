@@ -463,6 +463,99 @@ def test_agentv3_compat_uses_created_project_for_next_flow_save(monkeypatch) -> 
     assert "flow" in saved["body"]
 
 
+def test_agentv3_compat_subscription_current_handles_int_plan(monkeypatch) -> None:
+    class FakeBackend:
+        async def subscription_current(self, *, auth_claims=None):
+            return {"id": 5, "plan": 1, "status": "active"}
+
+    calls = 0
+
+    async def fake_agent_messages(_messages, *, settings=None, allow_tools=True):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return CompatAgentTurn(
+                text="Planingizni tekshiraman.",
+                tool_calls=[CompatToolCall(id="subscription-call", name="subscription_current", arguments={})],
+            )
+        return CompatAgentTurn(text="Siz plan#1 tarifidasiz, status active.")
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_messages)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/projects/global/runs",
+        json={"prompt": "meni planim qanday", "thread_id": "subscription_thread"},
+    )
+    assert created.status_code == 200
+
+    with client.stream("GET", f"/projects/global/runs/{created.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "subscription.current" in stream_text
+    assert "plan#1" in stream_text
+    assert "Backend error" not in stream_text
+
+
+def test_agentv3_compat_retry_reuses_failed_tool(monkeypatch) -> None:
+    class FakeBackend:
+        attempts = 0
+
+        async def subscription_current(self, *, auth_claims=None):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise RuntimeError("temporary subscription failure")
+            return {"plan": 2, "status": "active"}
+
+        async def create_release(self, *_args, **_kwargs):
+            raise AssertionError("retry should not deploy")
+
+    backend = FakeBackend()
+    calls = 0
+
+    async def fake_agent_messages(_messages, *, settings=None, allow_tools=True):
+        nonlocal calls
+        calls += 1
+        if calls in {1, 3}:
+            return CompatAgentTurn(
+                text="Planingizni tekshiraman.",
+                tool_calls=[CompatToolCall(id=f"subscription-call-{calls}", name="subscription_current", arguments={})],
+            )
+        if calls == 2:
+            return CompatAgentTurn(text="Planingizni olishda xatolik bo'ldi.")
+        return CompatAgentTurn(text="Qayta urinish muvaffaqiyatli: plan#2 active.")
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_messages)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: backend)
+    client = TestClient(create_app())
+
+    first = client.post(
+        "/projects/global/runs",
+        json={"prompt": "meni planim qanday", "thread_id": "retry_subscription_thread"},
+    )
+    assert first.status_code == 200
+    with client.stream("GET", f"/projects/global/runs/{first.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        first_stream = "".join(response.iter_text())
+    assert "subscription.current" in first_stream
+    assert "run_failed" in first_stream
+
+    second = client.post(
+        "/projects/global/runs",
+        json={"prompt": "qayta urun", "thread_id": "retry_subscription_thread"},
+    )
+    assert second.status_code == 200
+    with client.stream("GET", f"/projects/global/runs/{second.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        second_stream = "".join(response.iter_text())
+
+    assert "subscription.current" in second_stream
+    assert "release.deploy" not in second_stream
+    assert "plan#2" in second_stream
+
+
 def test_run_requires_auth_when_enabled(monkeypatch) -> None:
     monkeypatch.setenv("AGENTV4_AUTH_REQUIRED", "true")
     monkeypatch.setenv("AGENTV4_ENFORCE_USAGE_LIMITS", "false")

@@ -84,6 +84,7 @@ class CompatRunStore:
         self._runs: dict[str, CompatRun] = {}
         self._thread_messages: dict[tuple[str, str], list[dict[str, str]]] = {}
         self._thread_project_ids: dict[tuple[str, str], str] = {}
+        self._thread_failed_tools: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = asyncio.Lock()
 
     async def create(
@@ -152,6 +153,37 @@ class CompatRunStore:
             return
         async with self._lock:
             self._thread_project_ids[(user_id, thread_id)] = str(project_id)
+
+    async def last_failed_tool(self, *, user_id: str, thread_id: str | None) -> dict[str, Any] | None:
+        if thread_id is None:
+            return None
+        async with self._lock:
+            failed_tool = self._thread_failed_tools.get((user_id, thread_id))
+            return dict(failed_tool) if failed_tool else None
+
+    async def set_last_failed_tool(
+        self,
+        *,
+        user_id: str,
+        thread_id: str | None,
+        name: str,
+        arguments: dict[str, Any],
+        content: str,
+    ) -> None:
+        if thread_id is None:
+            return
+        async with self._lock:
+            self._thread_failed_tools[(user_id, thread_id)] = {
+                "name": name,
+                "arguments": dict(arguments),
+                "content": content,
+            }
+
+    async def clear_last_failed_tool(self, *, user_id: str, thread_id: str | None) -> None:
+        if thread_id is None:
+            return
+        async with self._lock:
+            self._thread_failed_tools.pop((user_id, thread_id), None)
 
     async def set_status(
         self,
@@ -345,11 +377,29 @@ async def _execute_run(
         )
         await store.append_thread_message(user_id=user_id, thread_id=thread_id, role="user", content=prompt)
 
-        first_turn = await run_compat_agent_messages(
-            _initial_agent_messages(prompt, history=history, current_project_id=current_project_id),
-            settings=settings,
-            allow_tools=True,
-        )
+        retry_tool = await store.last_failed_tool(user_id=user_id, thread_id=thread_id)
+        if retry_tool and _is_retry_prompt(prompt):
+            first_turn = CompatAgentTurn(
+                text="Oldingi xatolik bo'yicha qayta urinib ko'raman.",
+                tool_calls=[
+                    CompatToolCall(
+                        id=f"retry-{uuid4()}",
+                        name=str(retry_tool.get("name") or ""),
+                        arguments=dict(retry_tool.get("arguments") or {}),
+                    )
+                ],
+            )
+        else:
+            first_turn = await run_compat_agent_messages(
+                _initial_agent_messages(
+                    prompt,
+                    history=history,
+                    current_project_id=current_project_id,
+                    retry_tool=retry_tool,
+                ),
+                settings=settings,
+                allow_tools=True,
+            )
         total_input_tokens = first_turn.input_tokens
         total_output_tokens = first_turn.output_tokens
         if first_turn.text:
@@ -400,7 +450,12 @@ async def _execute_run(
                 settings=settings,
                 auth_claims=auth_claims,
                 current_project_id=current_project_id,
-                base_messages=_initial_agent_messages(prompt, history=history, current_project_id=current_project_id),
+                base_messages=_initial_agent_messages(
+                    prompt,
+                    history=history,
+                    current_project_id=current_project_id,
+                    retry_tool=retry_tool,
+                ),
                 user_id=user_id,
                 thread_id=thread_id,
             )
@@ -629,6 +684,7 @@ def _initial_agent_messages(
     *,
     history: list[dict[str, str]],
     current_project_id: str | None,
+    retry_tool: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = [{"role": "system", "content": compat_system_prompt()}]
     if current_project_id:
@@ -638,9 +694,35 @@ def _initial_agent_messages(
                 "content": f"Current Botmother project_id is `{current_project_id}`. Use it for 'this project' requests.",
             }
         )
+    if retry_tool:
+        messages.append(
+            {
+                "role": "system",
+                "content": (
+                    "Previous tool failed. If the user asks to retry, call the same tool again: "
+                    f"{retry_tool.get('name')} with arguments "
+                    f"{json.dumps(retry_tool.get('arguments') or {}, ensure_ascii=False)}."
+                ),
+            }
+        )
     messages.extend(history[-20:])
     messages.append({"role": "user", "content": prompt})
     return messages
+
+
+def _is_retry_prompt(prompt: str) -> bool:
+    normalized = prompt.strip().lower()
+    retry_phrases = {
+        "qayta urun",
+        "qayta urin",
+        "qayta urinib ko'r",
+        "qayta urinib kor",
+        "yana urin",
+        "yana urun",
+        "retry",
+        "try again",
+    }
+    return normalized in retry_phrases
 
 
 async def save_flow_to_project(
@@ -701,6 +783,16 @@ async def execute_backend_tool_loop(
         if next_project_id is not None:
             current_project_id = str(next_project_id)
             await store.set_thread_project_id(user_id=user_id, thread_id=thread_id, project_id=current_project_id)
+        if is_error:
+            await store.set_last_failed_tool(
+                user_id=user_id,
+                thread_id=thread_id,
+                name=current_tool_call.name,
+                arguments=current_tool_call.arguments,
+                content=tool_content,
+            )
+        else:
+            await store.clear_last_failed_tool(user_id=user_id, thread_id=thread_id)
         messages.extend(_tool_exchange_messages(current_turn, current_tool_call, tool_content, tool_data))
 
         next_turn = await run_compat_agent_messages(
@@ -954,6 +1046,11 @@ async def execute_backend_tool(
             plan_raw = subscription.get("plan")
             plan_details = subscription.get("plan_details")
             plan_name = subscription.get("plan_name")
+            if plan_details is None and isinstance(subscription.get("data"), dict):
+                data = subscription["data"]
+                plan_raw = data.get("plan", plan_raw)
+                plan_details = data.get("plan_details")
+                plan_name = data.get("plan_name") or plan_name
             if isinstance(plan_raw, dict):
                 plan_name = plan_raw.get("name") or plan_raw.get("display") or plan_name
             elif isinstance(plan_details, dict):
@@ -967,7 +1064,10 @@ async def execute_backend_tool(
                 # Some backend serializers return plan as id only.
                 plan_name = plan_name or f"plan#{plan_raw}"
 
-            status = subscription.get("status") or "unknown"
+            status = subscription.get("status")
+            if status is None and isinstance(subscription.get("data"), dict):
+                status = subscription["data"].get("status")
+            status = status or "unknown"
             return (
                 f"Current subscription: {plan_name or 'unknown'} (status={status}).",
                 {"subscription": subscription},
