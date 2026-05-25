@@ -125,6 +125,40 @@ class BackendClient:
         payload = await self._request("GET", "/api/subscription/usage/", **_auth_kw(auth_claims))
         return _unwrap_item(payload)
 
+    async def subscription_current(self, *, auth_claims: dict | None = None) -> dict[str, Any]:
+        payload = await self._request("GET", "/api/subscription/", **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def subscription_upgrade(
+        self,
+        *,
+        plan_id: int,
+        months: int = 1,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            "/api/subscription/upgrade/",
+            json={"plan_id": plan_id, "months": months},
+            **_auth_kw(auth_claims),
+        )
+        return _unwrap_item(payload)
+
+    async def create_payment_link(
+        self,
+        *,
+        method: str,
+        amount: int,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            "POST",
+            "/api/payment/create-transaction/",
+            json={"method": method, "amount": amount},
+            **_auth_kw(auth_claims),
+        )
+        return _unwrap_item(payload)
+
     async def list_projects(
         self,
         *,

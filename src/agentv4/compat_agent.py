@@ -32,6 +32,9 @@ TOOL_EVENT_NAMES = {
     "release_deploy": "release.deploy",
     "release_status": "release.status",
     "plans_list": "plans.list",
+    "subscription_current": "subscription.current",
+    "subscription_upgrade": "subscription.upgrade",
+    "payment_link_create": "payment.link.create",
     "file_list": "file.list",
     "file_delete": "file.delete",
     "collection_list": "collection.list",
@@ -347,6 +350,19 @@ def _ops_tool_specs() -> list[dict[str, Any]]:
         ),
         _tool_spec("release_status", "Get status of a release by id.", {"release_id": _id("Release id."), "project_id": _project_id_optional()}, required=["release_id"]),
         _tool_spec("plans_list", "List available pricing plans."),
+        _tool_spec("subscription_current", "Get current user's active subscription plan."),
+        _tool_spec(
+            "subscription_upgrade",
+            "Upgrade or change the current user's subscription plan.",
+            {"plan_id": {"type": "integer"}, "months": {"type": "integer", "enum": [1, 3, 6, 12], "default": 1}},
+            required=["plan_id"],
+        ),
+        _tool_spec(
+            "payment_link_create",
+            "Create a payment top-up link for the current user.",
+            {"method": {"type": "string", "enum": ["click", "payme"]}, "amount": {"type": "integer", "minimum": 1}},
+            required=["method", "amount"],
+        ),
         _tool_spec("file_list", "List files belonging to a project.", {"project_id": _project_id_optional(), "limit": _limit(50, 200)}),
         _tool_spec("file_delete", "Delete a file by id.", {"file_id": _id("File id.")}, required=["file_id"]),
         _tool_spec("collection_list", "List legacy backend collection metadata for a project.", {"project_id": _project_id_optional()}),
@@ -429,7 +445,9 @@ Work like a coding agent with tools:
 - If the user is chatting, greeting you, asking who you are, or asking a general question, answer directly.
 - If the user asks to create, generate, change, connect, deploy, or configure a bot/flow, call the botbuilder_ai_build tool.
 - If the user asks about their projects, files, environment variables, releases/deploys, pricing plans,
-  chat users/history, broadcasts/messages, collections, or CMS data, use the matching management tools.
+  current subscription, payment link, chat users/history, broadcasts/messages, collections, or CMS data,
+  use the matching management tools.
+- If the user asks "qaysi plandaman" (which plan am I on), use subscription_current (not release_list).
 - Use project_id from the current run when the user does not provide one. If an operation cannot be done
   without choosing a project, list projects or ask the user to choose.
 - For destructive tools (delete, deploy, broadcast_send), call them only after the user clearly asks or confirms.

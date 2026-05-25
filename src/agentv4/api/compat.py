@@ -946,6 +946,60 @@ async def execute_backend_tool(
             summary = ", ".join(f"{item['name']}#{item['id']}({item['price']})" for item in plans if item.get("name")) or "(none)"
             return f"{len(plans)} plan(s): {summary}", {"plans": plans}, False
 
+        if name == "subscription_current":
+            subscription = await backend.subscription_current(auth_claims=auth_claims)
+            plan = subscription.get("plan") if isinstance(subscription, dict) else {}
+            plan_name = (
+                plan.get("name")
+                or plan.get("display")
+                or subscription.get("plan_name")
+                or "unknown"
+            )
+            status = subscription.get("status") or "unknown"
+            return (
+                f"Current subscription: {plan_name} (status={status}).",
+                {"subscription": subscription},
+                False,
+            )
+
+        if name == "subscription_upgrade":
+            plan_id = arguments.get("plan_id")
+            if plan_id is None:
+                return "plan_id is required.", {"tool": event_name}, True
+            months = int(arguments.get("months") or 1)
+            upgrade = await backend.subscription_upgrade(
+                plan_id=int(plan_id),
+                months=months,
+                auth_claims=auth_claims,
+            )
+            new_plan = upgrade.get("new_plan") or upgrade.get("plan_name") or "updated"
+            return (
+                f"Subscription updated: {new_plan}.",
+                {"subscription_upgrade": upgrade},
+                False,
+            )
+
+        if name == "payment_link_create":
+            method = str(arguments.get("method") or "").strip().lower()
+            amount = arguments.get("amount")
+            if method not in {"click", "payme"}:
+                return "method must be one of: click, payme.", {"tool": event_name}, True
+            if amount is None:
+                return "amount is required.", {"tool": event_name}, True
+            payment = await backend.create_payment_link(
+                method=method,
+                amount=int(amount),
+                auth_claims=auth_claims,
+            )
+            link = payment.get("link")
+            if not link:
+                return "Payment link was not returned by backend.", {"payment": payment}, True
+            return (
+                f"Payment link created via {method}: {link}",
+                {"payment": {"method": method, "amount": int(amount), "link": link}},
+                False,
+            )
+
         if name == "file_list":
             items = await backend.list_files(_project_id_arg(arguments, current_project_id), auth_claims=auth_claims)
             files = [
