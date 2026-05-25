@@ -4,6 +4,7 @@ import pytest
 
 from agentv4.ai import AIBuildRequest, parse_commands, user_prompt
 from agentv4.builder.session import build_from_commands
+from agentv4.openai_payload import add_completion_token_limit
 
 
 def test_parse_ai_commands_json() -> None:
@@ -21,6 +22,22 @@ def test_parse_ai_commands_json() -> None:
 
     assert result.ok is True
     assert commands[0].action == "create_bot"
+
+
+def test_gpt_5_uses_max_completion_tokens() -> None:
+    payload: dict[str, object] = {}
+
+    add_completion_token_limit(payload, model="gpt-5.2", max_tokens=1800)
+
+    assert payload == {"max_completion_tokens": 1800}
+
+
+def test_legacy_models_use_max_tokens() -> None:
+    payload: dict[str, object] = {}
+
+    add_completion_token_limit(payload, model="gpt-4o-mini", max_tokens=1800)
+
+    assert payload == {"max_tokens": 1800}
 
 
 def test_parse_tolerates_command_key_and_string_buttons() -> None:

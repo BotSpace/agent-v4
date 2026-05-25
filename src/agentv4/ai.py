@@ -17,6 +17,7 @@ from .builder.models import CompileResult
 from .builder.session import build_from_commands
 from .config import get_settings
 from .engine_catalog import engine_catalog_prompt
+from .openai_payload import add_completion_token_limit
 
 COMMANDS_ADAPTER = TypeAdapter(list[BotCommand])
 
@@ -219,10 +220,10 @@ async def call_openai_stream(
         ],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
-        "max_tokens": settings.openai_max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    add_completion_token_limit(payload, model=model, max_tokens=settings.openai_max_tokens)
 
     body_parts: list[str] = []
     input_tokens = 0
@@ -294,8 +295,8 @@ def call_openai_sync(
         ],
         "temperature": 0.2,
         "response_format": {"type": "json_object"},
-        "max_tokens": settings.openai_max_tokens,
     }
+    add_completion_token_limit(payload, model=model, max_tokens=settings.openai_max_tokens)
     timeout = settings.openai_timeout
     req = urllib.request.Request(
         "https://api.openai.com/v1/chat/completions",

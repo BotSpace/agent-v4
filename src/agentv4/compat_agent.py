@@ -9,6 +9,7 @@ from typing import Any
 
 from .ai import AIConfigurationError
 from .config import Settings, get_settings
+from .openai_payload import add_completion_token_limit
 
 BOTBUILDER_TOOL_NAME = "botbuilder_ai_build"
 BOTBUILDER_EVENT_NAME = "botbuilder.ai_build"
@@ -176,8 +177,8 @@ def _call_chat_completions_sync(
         "model": settings.openai_model,
         "messages": messages,
         "temperature": 0.3,
-        "max_tokens": settings.openai_max_tokens,
     }
+    add_completion_token_limit(payload, model=settings.openai_model, max_tokens=settings.openai_max_tokens)
     if tools:
         payload["tools"] = tools
     if tool_choice:
