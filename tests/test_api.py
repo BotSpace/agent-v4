@@ -6,7 +6,7 @@ from agentv4.ai import AIBuildResponse
 from agentv4.backend import get_backend_client
 from agentv4.builder.commands import CreateBotCommand, AddTextCommand
 from agentv4.builder.session import build_from_commands
-from agentv4.compat_agent import BOTBUILDER_TOOL_NAME, CompatAgentTurn, CompatToolCall
+from agentv4.compat_agent import BOTBUILDER_TOOL_NAME, PROJECT_LIST_TOOL_NAME, CompatAgentTurn, CompatToolCall
 from agentv4.config import get_settings
 
 
@@ -207,6 +207,67 @@ def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
     assert status.status_code == 200
     assert status.json()["status"] == "completed"
     assert "Men Botmother AgentV4man" in status.json()["final_response"]
+
+
+def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
+    class FakeBackend:
+        async def list_projects(self, *, search=None, auth_claims=None):
+            return [
+                {"id": 1, "name": "Kafe bot", "status": "active"},
+                {"id": 2, "name": "Support bot", "status": "draft"},
+            ]
+
+    async def fake_agent_turn(_prompt, *, settings=None):
+        return CompatAgentTurn(
+            text="Loyihalarni tekshiraman.",
+            tool_calls=[
+                CompatToolCall(
+                    id="tool-call-projects",
+                    name=PROJECT_LIST_TOOL_NAME,
+                    arguments={},
+                )
+            ],
+            input_tokens=5,
+            output_tokens=6,
+        )
+
+    async def fake_agent_final(*_args, **_kwargs):
+        return CompatAgentTurn(
+            text="2 ta loyiha topildi: Kafe bot va Support bot.",
+            input_tokens=3,
+            output_tokens=4,
+        )
+
+    async def fail_build_bot_with_ai_stream(_request, *, on_delta=None):
+        raise AssertionError("project listing should not call botbuilder")
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_final", fake_agent_final)
+    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fail_build_bot_with_ai_stream)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "loyihalarimni ko'rsat", "thread_id": "thread_1"},
+    )
+    assert created.status_code == 200
+    request_id = created.json()["request_id"]
+
+    with client.stream("GET", f"/projects/project_1/runs/{request_id}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "event: tool_call" in stream_text
+    assert "project.list" in stream_text
+    assert "event: tool_result" in stream_text
+    assert "Kafe bot" in stream_text
+    assert "botbuilder.ai_build" not in stream_text
+
+    status = client.get(f"/projects/project_1/runs/{request_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
+    assert "2 ta loyiha topildi" in status.json()["final_response"]
 
 
 def test_run_requires_auth_when_enabled(monkeypatch) -> None:

@@ -12,6 +12,20 @@ from .config import Settings, get_settings
 
 BOTBUILDER_TOOL_NAME = "botbuilder_ai_build"
 BOTBUILDER_EVENT_NAME = "botbuilder.ai_build"
+PROJECT_LIST_TOOL_NAME = "project_list"
+PROJECT_GET_TOOL_NAME = "project_get"
+PROJECT_CREATE_TOOL_NAME = "project_create"
+PROJECT_UPDATE_TOOL_NAME = "project_update"
+PROJECT_DELETE_TOOL_NAME = "project_delete"
+
+TOOL_EVENT_NAMES = {
+    BOTBUILDER_TOOL_NAME: BOTBUILDER_EVENT_NAME,
+    PROJECT_LIST_TOOL_NAME: "project.list",
+    PROJECT_GET_TOOL_NAME: "project.get",
+    PROJECT_CREATE_TOOL_NAME: "project.create",
+    PROJECT_UPDATE_TOOL_NAME: "project.update",
+    PROJECT_DELETE_TOOL_NAME: "project.delete",
+}
 
 
 @dataclass(frozen=True)
@@ -37,7 +51,7 @@ async def run_compat_agent_turn(prompt: str, *, settings: Settings | None = None
             {"role": "system", "content": compat_system_prompt()},
             {"role": "user", "content": prompt},
         ],
-        tools=[botbuilder_tool_spec()],
+        tools=compat_tool_specs(),
         tool_choice="auto",
     )
 
@@ -186,6 +200,91 @@ def botbuilder_tool_spec() -> dict[str, Any]:
     }
 
 
+def compat_tool_specs() -> list[dict[str, Any]]:
+    return [
+        botbuilder_tool_spec(),
+        {
+            "type": "function",
+            "function": {
+                "name": PROJECT_LIST_TOOL_NAME,
+                "description": "List bot projects belonging to the current user.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "search": {"type": "string", "description": "Optional project name search filter."}
+                    },
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": PROJECT_GET_TOOL_NAME,
+                "description": "Fetch one bot project by id. Optionally include its saved flow JSON.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["string", "integer"], "description": "Project id."},
+                        "include_flow": {"type": "boolean", "description": "Whether to include saved flow JSON."},
+                    },
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": PROJECT_CREATE_TOOL_NAME,
+                "description": "Create a new bot project.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Bot project name."},
+                        "description": {"type": "string", "description": "Optional project description."},
+                        "token": {"type": "string", "description": "Optional Telegram bot token."},
+                    },
+                    "required": ["name"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": PROJECT_UPDATE_TOOL_NAME,
+                "description": "Update a bot project's name, description, token, or saved flow.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": ["string", "integer"], "description": "Project id."},
+                        "name": {"type": "string"},
+                        "description": {"type": "string"},
+                        "token": {"type": "string"},
+                        "flow": {"type": "object", "description": "Saved flow JSON."},
+                    },
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": PROJECT_DELETE_TOOL_NAME,
+                "description": "Delete a bot project permanently. Use only when the user explicitly asks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"id": {"type": ["string", "integer"], "description": "Project id."}},
+                    "required": ["id"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+
+
 def compat_system_prompt() -> str:
     return """
 You are Botmother AgentV4, a conversational agent for building Botmother visual bot flows.
@@ -193,6 +292,7 @@ You are Botmother AgentV4, a conversational agent for building Botmother visual 
 Work like a coding agent with tools:
 - If the user is chatting, greeting you, asking who you are, or asking a general question, answer directly.
 - If the user asks to create, generate, change, connect, deploy, or configure a bot/flow, call the botbuilder_ai_build tool.
+- If the user asks about their projects, list/fetch/create/update/delete projects with project_* tools.
 - Do not call tools for casual chat.
 - After a tool result, explain briefly what happened and point to the returned flow data when relevant.
 - Reply in the user's language. Uzbek Latin is preferred when the user writes Uzbek.

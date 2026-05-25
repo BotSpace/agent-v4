@@ -24,6 +24,20 @@ def _unwrap_item(payload: Any) -> dict[str, Any]:
     return payload
 
 
+def _unwrap_list(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    results = data.get("results") if isinstance(data, dict) else None
+    if isinstance(results, list):
+        return results
+    if isinstance(payload.get("results"), list):
+        return payload["results"]
+    return []
+
+
 def _auth_kw(auth_claims: dict | None) -> dict[str, Any]:
     if not auth_claims:
         return {}
@@ -74,18 +88,26 @@ class BackendClient:
         method: str,
         path: str,
         *,
+        params: dict[str, Any] | None = None,
         json: Any | None = None,
         bearer: str | None = None,
         refresh_token: str | None = None,
     ) -> Any:
         url = self._base_url + path
-        response = await self._client.request(method, url, json=json, headers=self._headers(bearer=bearer))
+        response = await self._client.request(
+            method,
+            url,
+            params=params,
+            json=json,
+            headers=self._headers(bearer=bearer),
+        )
         if response.status_code == 401 and refresh_token:
             new_access = await self._try_refresh(refresh_token)
             if new_access:
                 response = await self._client.request(
                     method,
                     url,
+                    params=params,
                     json=json,
                     headers=self._headers(bearer=new_access),
                 )
@@ -102,6 +124,37 @@ class BackendClient:
     async def subscription_usage(self, *, auth_claims: dict | None = None) -> dict[str, Any]:
         payload = await self._request("GET", "/api/subscription/usage/", **_auth_kw(auth_claims))
         return _unwrap_item(payload)
+
+    async def list_projects(
+        self,
+        *,
+        search: str | None = None,
+        auth_claims: dict | None = None,
+    ) -> list[dict[str, Any]]:
+        params = {"search": search} if search else None
+        payload = await self._request("GET", "/api/project/", params=params, **_auth_kw(auth_claims))
+        return _unwrap_list(payload)
+
+    async def get_project(self, project_id: str | int, *, auth_claims: dict | None = None) -> dict[str, Any]:
+        payload = await self._request("GET", f"/api/project/{project_id}/", **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def create_project(self, body: dict[str, Any], *, auth_claims: dict | None = None) -> dict[str, Any]:
+        payload = await self._request("POST", "/api/project/", json=body, **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def update_project(
+        self,
+        project_id: str | int,
+        body: dict[str, Any],
+        *,
+        auth_claims: dict | None = None,
+    ) -> dict[str, Any]:
+        payload = await self._request("PATCH", f"/api/project/{project_id}/", json=body, **_auth_kw(auth_claims))
+        return _unwrap_item(payload)
+
+    async def delete_project(self, project_id: str | int, *, auth_claims: dict | None = None) -> None:
+        await self._request("DELETE", f"/api/project/{project_id}/", **_auth_kw(auth_claims))
 
     async def report_token_usage(
         self,

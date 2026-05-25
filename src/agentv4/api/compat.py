@@ -14,7 +14,15 @@ from pydantic import BaseModel, Field
 
 from ..ai import AIBuildRequest, build_bot_with_ai_stream
 from ..backend import get_backend_client
-from ..compat_agent import BOTBUILDER_EVENT_NAME, BOTBUILDER_TOOL_NAME
+from ..compat_agent import (
+    BOTBUILDER_TOOL_NAME,
+    PROJECT_CREATE_TOOL_NAME,
+    PROJECT_DELETE_TOOL_NAME,
+    PROJECT_GET_TOOL_NAME,
+    PROJECT_LIST_TOOL_NAME,
+    PROJECT_UPDATE_TOOL_NAME,
+    TOOL_EVENT_NAMES,
+)
 from ..compat_agent import run_compat_agent_final, run_compat_agent_turn
 from ..config import Settings
 from ..limits import require_available_ai_tokens
@@ -297,11 +305,8 @@ async def _execute_run(
             project_id = run.project_id if run else None
             user_id = run.user_id if run else ""
 
-        botbuilder_call = next(
-            (call for call in first_turn.tool_calls if call.name == BOTBUILDER_TOOL_NAME),
-            None,
-        )
-        if botbuilder_call is None:
+        tool_call = next((call for call in first_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
+        if tool_call is None:
             message = first_turn.text or "Tushundim."
             await store.set_status(request_id, "completed", final_response=message)
             await report_usage_if_needed(
@@ -314,16 +319,72 @@ async def _execute_run(
             await store.add_event(request_id, "run_completed", {"request_id": request_id})
             return
 
-        tool_prompt = str(botbuilder_call.arguments.get("prompt") or prompt)
         await store.add_event(
             request_id,
             "tool_call",
             {
-                "id": botbuilder_call.id,
-                "name": BOTBUILDER_EVENT_NAME,
-                "arguments": {"prompt": tool_prompt},
+                "id": tool_call.id,
+                "name": TOOL_EVENT_NAMES[tool_call.name],
+                "arguments": tool_call.arguments,
             },
         )
+
+        if tool_call.name != BOTBUILDER_TOOL_NAME:
+            tool_content, tool_data, is_error = await execute_backend_tool(
+                tool_call.name,
+                tool_call.arguments,
+                settings=settings,
+                auth_claims=run.auth_claims if run else {},
+            )
+            await store.add_event(
+                request_id,
+                "tool_result",
+                {
+                    "tool_call_id": tool_call.id,
+                    "content": tool_content,
+                    "is_error": is_error,
+                    "data": tool_data,
+                },
+            )
+            final_turn = await run_compat_agent_final(
+                prompt,
+                assistant_text=first_turn.text,
+                tool_call=tool_call,
+                tool_content=tool_content,
+                tool_data=tool_data,
+                settings=settings,
+            )
+            total_input_tokens += final_turn.input_tokens
+            total_output_tokens += final_turn.output_tokens
+            message = final_turn.text or tool_content
+            status = "failed" if is_error else "completed"
+            await store.set_status(request_id, status, final_response=message, error=message if is_error else None)
+            await store.add_event(
+                request_id,
+                "assistant_message",
+                {
+                    "text": message,
+                    "usage": {
+                        "input_tokens": final_turn.input_tokens,
+                        "output_tokens": final_turn.output_tokens,
+                    },
+                },
+            )
+            await report_usage_if_needed(
+                settings=settings,
+                user_id=user_id,
+                project_id=project_id,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+            await store.add_event(
+                request_id,
+                "run_failed" if is_error else "run_completed",
+                {"error": message} if is_error else {"request_id": request_id},
+            )
+            return
+
+        tool_prompt = str(tool_call.arguments.get("prompt") or prompt)
         stream_buffer = ""
         stream_started = False
 
@@ -372,7 +433,7 @@ async def _execute_run(
             request_id,
             "tool_result",
             {
-                "tool_call_id": botbuilder_call.id,
+                "tool_call_id": tool_call.id,
                 "content": tool_content,
                 "is_error": not result.ok,
                 "data": tool_data,
@@ -382,7 +443,7 @@ async def _execute_run(
             final_turn = await run_compat_agent_final(
                 prompt,
                 assistant_text=first_turn.text,
-                tool_call=botbuilder_call,
+                tool_call=tool_call,
                 tool_content=tool_content,
                 tool_data=tool_data,
                 settings=settings,
@@ -476,3 +537,59 @@ async def report_usage_if_needed(
         )
     except Exception:
         pass
+
+
+async def execute_backend_tool(
+    name: str,
+    arguments: dict[str, Any],
+    *,
+    settings: Settings,
+    auth_claims: dict[str, Any],
+) -> tuple[str, dict[str, Any], bool]:
+    backend = get_backend_client(settings)
+    try:
+        if name == PROJECT_LIST_TOOL_NAME:
+            projects = await backend.list_projects(search=arguments.get("search"), auth_claims=auth_claims)
+            summary = [
+                {"id": item.get("id"), "name": item.get("name"), "status": item.get("status")}
+                for item in projects
+            ]
+            names = ", ".join(f"{item['name']} (id={item['id']})" for item in summary) or "(none)"
+            return f"Found {len(summary)} project(s): {names}", {"projects": summary}, False
+
+        if name == PROJECT_GET_TOOL_NAME:
+            project_id = arguments.get("id")
+            project = await backend.get_project(project_id, auth_claims=auth_claims)
+            if not arguments.get("include_flow") and isinstance(project.get("flow"), dict):
+                project = {key: value for key, value in project.items() if key != "flow"}
+            return f"Project `{project.get('name', project_id)}` loaded.", {"project": project}, False
+
+        if name == PROJECT_CREATE_TOOL_NAME:
+            body = {key: value for key, value in arguments.items() if key in {"name", "description", "token"}}
+            project = await backend.create_project(body, auth_claims=auth_claims)
+            return (
+                f"Project `{project.get('name')}` created with id `{project.get('id')}`.",
+                {"project": project},
+                False,
+            )
+
+        if name == PROJECT_UPDATE_TOOL_NAME:
+            project_id = arguments.get("id")
+            body = {
+                key: value
+                for key, value in arguments.items()
+                if key in {"name", "description", "token", "flow"} and value is not None
+            }
+            if not body:
+                return "Nothing to update.", {"project_id": project_id}, True
+            project = await backend.update_project(project_id, body, auth_claims=auth_claims)
+            return f"Project `{project_id}` updated.", {"project": project}, False
+
+        if name == PROJECT_DELETE_TOOL_NAME:
+            project_id = arguments.get("id")
+            await backend.delete_project(project_id, auth_claims=auth_claims)
+            return f"Project `{project_id}` deleted.", {"project_id": project_id}, False
+
+        return f"Unknown tool `{name}`.", {"tool": name}, True
+    except Exception as exc:
+        return f"Backend error: {exc}", {"tool": name, "error": str(exc)}, True
