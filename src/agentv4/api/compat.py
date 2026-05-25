@@ -948,16 +948,20 @@ async def execute_backend_tool(
 
         if name == "subscription_current":
             subscription = await backend.subscription_current(auth_claims=auth_claims)
-            plan = subscription.get("plan") if isinstance(subscription, dict) else {}
-            plan_name = (
-                plan.get("name")
-                or plan.get("display")
-                or subscription.get("plan_name")
-                or "unknown"
-            )
+            if not isinstance(subscription, dict):
+                return "Subscription payload is invalid.", {"subscription": subscription}, True
+
+            plan_raw = subscription.get("plan")
+            plan_name = subscription.get("plan_name")
+            if isinstance(plan_raw, dict):
+                plan_name = plan_raw.get("name") or plan_raw.get("display") or plan_name
+            elif isinstance(plan_raw, (int, str)):
+                # Some backend serializers return plan as id only.
+                plan_name = plan_name or f"plan#{plan_raw}"
+
             status = subscription.get("status") or "unknown"
             return (
-                f"Current subscription: {plan_name} (status={status}).",
+                f"Current subscription: {plan_name or 'unknown'} (status={status}).",
                 {"subscription": subscription},
                 False,
             )
