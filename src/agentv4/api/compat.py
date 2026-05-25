@@ -183,7 +183,9 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
         body: RunCreateRequest,
         user: CurrentUser = Depends(get_current_user),
     ) -> RunCreateResponse:
-        await require_available_ai_tokens(user, settings)
+        should_build_flow = body.baseline_flow is not None or is_flow_build_prompt(body.prompt)
+        if should_build_flow:
+            await require_available_ai_tokens(user, settings)
         run = await store.create(
             project_id=project_id,
             user_id=user.user_id,
@@ -191,7 +193,9 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
             thread_id=body.thread_id,
             auth_claims=user.claims,
         )
-        run.task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt, settings=settings))
+        run.task = asyncio.create_task(
+            _execute_run(store, run.request_id, body.prompt, settings=settings, should_build_flow=should_build_flow)
+        )
         return RunCreateResponse(request_id=run.request_id, status="queued")
 
     @router.get("/projects/{project_id}/runs/{request_id}", response_model=RunStatusResponse)
@@ -264,9 +268,24 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
     return router
 
 
-async def _execute_run(store: CompatRunStore, request_id: str, prompt: str, *, settings: Settings) -> None:
+async def _execute_run(
+    store: CompatRunStore,
+    request_id: str,
+    prompt: str,
+    *,
+    settings: Settings,
+    should_build_flow: bool,
+) -> None:
     await store.set_status(request_id, "running")
     await store.add_event(request_id, "run_started", {"request_id": request_id})
+    if not should_build_flow:
+        message = conversational_reply(prompt)
+        await store.set_status(request_id, "completed", final_response=message)
+        await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
+        await store.add_event(request_id, "run_completed", {"request_id": request_id})
+        await store.finish_streams(request_id)
+        return
+
     tool_call_id = f"tool-{request_id[:8]}"
     await store.add_event(
         request_id,
@@ -363,3 +382,51 @@ async def _event_stream(
 
 def _sse_event(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+def is_flow_build_prompt(prompt: str) -> bool:
+    text = prompt.casefold()
+    build_markers = (
+        "bot yarat",
+        "bot yas",
+        "bot qur",
+        "flow yarat",
+        "flow qur",
+        "oqim yarat",
+        "воронк",
+        "создай",
+        "сделай бот",
+        "build",
+        "create bot",
+        "make bot",
+        "add node",
+        "connect",
+    )
+    edit_markers = (
+        "qo'sh",
+        "qosh",
+        "o'zgartir",
+        "ozgartir",
+        "tahrir",
+        "ulab",
+        "ulang",
+        "trigger",
+        "tugma",
+        "button",
+        "node",
+        "deploy",
+    )
+    if any(marker in text for marker in build_markers):
+        return True
+    return ("bot" in text or "flow" in text) and any(marker in text for marker in edit_markers)
+
+
+def conversational_reply(prompt: str) -> str:
+    text = prompt.casefold()
+    if "isming" in text or "oting" in text or "who are you" in text or "your name" in text:
+        return (
+            "Salom! Men Botmother AgentV4man. Bot flow tuzish, o'zgartirish va tekshirishda yordam beraman."
+        )
+    if "salom" in text or "assalomu" in text or "hello" in text or "hi" in text:
+        return "Salom! Men shu yerdaman. Qanday bot yoki flow ustida ishlaymiz?"
+    return "Tushundim. Bot yoki flow bo'yicha nima qilishim kerakligini yozing, men yordam beraman."

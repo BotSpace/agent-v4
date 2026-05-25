@@ -145,6 +145,34 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
     assert "Bot flow tayyor" in status.json()["final_response"]
 
 
+def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
+    async def fail_build_bot_with_ai(_request):
+        raise AssertionError("casual chat should not call botbuilder")
+
+    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai", fail_build_bot_with_ai)
+    client = TestClient(create_app())
+
+    created = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "salom isming nima", "thread_id": "thread_1"},
+    )
+    assert created.status_code == 200
+    request_id = created.json()["request_id"]
+
+    with client.stream("GET", f"/projects/project_1/runs/{request_id}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "event: assistant_message" in stream_text
+    assert "botbuilder.ai_build" not in stream_text
+    assert "Men Botmother AgentV4man" in stream_text
+
+    status = client.get(f"/projects/project_1/runs/{request_id}")
+    assert status.status_code == 200
+    assert status.json()["status"] == "completed"
+    assert "Men Botmother AgentV4man" in status.json()["final_response"]
+
+
 def test_run_requires_auth_when_enabled(monkeypatch) -> None:
     monkeypatch.setenv("AGENTV4_AUTH_REQUIRED", "true")
     monkeypatch.setenv("AGENTV4_ENFORCE_USAGE_LIMITS", "false")
