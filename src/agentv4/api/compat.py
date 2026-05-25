@@ -12,8 +12,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from ..ai import AIBuildRequest, build_bot_with_ai
+from ..ai import AIBuildRequest, build_bot_with_ai_stream
 from ..backend import get_backend_client
+from ..compat_agent import BOTBUILDER_EVENT_NAME, BOTBUILDER_TOOL_NAME
+from ..compat_agent import run_compat_agent_final, run_compat_agent_turn
 from ..config import Settings
 from ..limits import require_available_ai_tokens
 from .auth import CurrentUser, get_current_user
@@ -183,9 +185,7 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
         body: RunCreateRequest,
         user: CurrentUser = Depends(get_current_user),
     ) -> RunCreateResponse:
-        should_build_flow = body.baseline_flow is not None or is_flow_build_prompt(body.prompt)
-        if should_build_flow:
-            await require_available_ai_tokens(user, settings)
+        await require_available_ai_tokens(user, settings)
         run = await store.create(
             project_id=project_id,
             user_id=user.user_id,
@@ -193,9 +193,7 @@ def create_compat_router(store: CompatRunStore, *, settings: Settings) -> APIRou
             thread_id=body.thread_id,
             auth_claims=user.claims,
         )
-        run.task = asyncio.create_task(
-            _execute_run(store, run.request_id, body.prompt, settings=settings, should_build_flow=should_build_flow)
-        )
+        run.task = asyncio.create_task(_execute_run(store, run.request_id, body.prompt, settings=settings))
         return RunCreateResponse(request_id=run.request_id, status="queued")
 
     @router.get("/projects/{project_id}/runs/{request_id}", response_model=RunStatusResponse)
@@ -274,30 +272,92 @@ async def _execute_run(
     prompt: str,
     *,
     settings: Settings,
-    should_build_flow: bool,
 ) -> None:
     await store.set_status(request_id, "running")
     await store.add_event(request_id, "run_started", {"request_id": request_id})
-    if not should_build_flow:
-        message = conversational_reply(prompt)
-        await store.set_status(request_id, "completed", final_response=message)
-        await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
-        await store.add_event(request_id, "run_completed", {"request_id": request_id})
-        await store.finish_streams(request_id)
-        return
-
-    tool_call_id = f"tool-{request_id[:8]}"
-    await store.add_event(
-        request_id,
-        "tool_call",
-        {"id": tool_call_id, "name": "botbuilder.ai_build", "arguments": {"prompt": prompt}},
-    )
     try:
-        result = await build_bot_with_ai(AIBuildRequest(prompt=prompt, language="uz", max_repair_attempts=2))
+        first_turn = await run_compat_agent_turn(prompt, settings=settings)
+        total_input_tokens = first_turn.input_tokens
+        total_output_tokens = first_turn.output_tokens
+        if first_turn.text:
+            await store.add_event(
+                request_id,
+                "assistant_message",
+                {
+                    "text": first_turn.text,
+                    "usage": {
+                        "input_tokens": first_turn.input_tokens,
+                        "output_tokens": first_turn.output_tokens,
+                    },
+                },
+            )
+
         async with store._lock:
             run = store._runs.get(request_id)
             project_id = run.project_id if run else None
             user_id = run.user_id if run else ""
+
+        botbuilder_call = next(
+            (call for call in first_turn.tool_calls if call.name == BOTBUILDER_TOOL_NAME),
+            None,
+        )
+        if botbuilder_call is None:
+            message = first_turn.text or "Tushundim."
+            await store.set_status(request_id, "completed", final_response=message)
+            await report_usage_if_needed(
+                settings=settings,
+                user_id=user_id,
+                project_id=project_id,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
+            await store.add_event(request_id, "run_completed", {"request_id": request_id})
+            return
+
+        tool_prompt = str(botbuilder_call.arguments.get("prompt") or prompt)
+        await store.add_event(
+            request_id,
+            "tool_call",
+            {
+                "id": botbuilder_call.id,
+                "name": BOTBUILDER_EVENT_NAME,
+                "arguments": {"prompt": tool_prompt},
+            },
+        )
+        stream_buffer = ""
+        stream_started = False
+
+        async def emit_stream_progress(delta: str) -> None:
+            nonlocal stream_buffer, stream_started
+            if not stream_started:
+                stream_started = True
+                await store.add_event(
+                    request_id,
+                    "thinking_delta",
+                    {"delta": "Model javobni real time tayyorlayapti...\n"},
+                )
+            stream_buffer += delta
+            if len(stream_buffer) < 120:
+                return
+            stream_buffer = ""
+            await store.add_event(
+                request_id,
+                "thinking_delta",
+                {"delta": "Yangi chunk olindi, bot komandalar yig'ilmoqda...\n"},
+            )
+
+        result = await build_bot_with_ai_stream(
+            AIBuildRequest(prompt=tool_prompt, language="uz", max_repair_attempts=2),
+            on_delta=emit_stream_progress,
+        )
+        if stream_started:
+            await store.add_event(
+                request_id,
+                "thinking_delta",
+                {"delta": "Model javobi olindi, flow compile qilinmoqda...\n"},
+            )
+        total_input_tokens += result.input_tokens
+        total_output_tokens += result.output_tokens
         if settings.report_token_usage and (result.input_tokens or result.output_tokens):
             try:
                 backend = get_backend_client(settings)
@@ -311,31 +371,55 @@ async def _execute_run(
                 pass
         flow = result.result.flow.model_dump(mode="json") if result.result.flow else None
         issues = [issue.model_dump(mode="json") for issue in result.result.issues]
+        tool_content = "Flow compiled" if result.ok else "Flow validation failed"
+        tool_data = {
+            "ok": result.ok,
+            "attempts": result.attempts,
+            "commands": result.commands,
+            "flow": flow,
+            "issues": issues,
+        }
         await store.add_event(
             request_id,
             "tool_result",
             {
-                "tool_call_id": tool_call_id,
-                "content": "Flow compiled" if result.ok else "Flow validation failed",
+                "tool_call_id": botbuilder_call.id,
+                "content": tool_content,
                 "is_error": not result.ok,
-                "data": {
-                    "ok": result.ok,
-                    "attempts": result.attempts,
-                    "commands": result.commands,
-                    "flow": flow,
-                    "issues": issues,
-                },
+                "data": tool_data,
             },
         )
         if result.ok:
-            node_count = len(flow["nodes"]) if flow else 0
-            edge_count = len(flow["edges"]) if flow else 0
-            message = (
-                f"Bot flow tayyor. {node_count} ta node va {edge_count} ta edge yaratildi.\n\n"
-                "Flow JSON `tool_result.data.flow` ichida qaytdi."
+            final_turn = await run_compat_agent_final(
+                prompt,
+                assistant_text=first_turn.text,
+                tool_call=botbuilder_call,
+                tool_content=tool_content,
+                tool_data=tool_data,
+                settings=settings,
             )
+            total_input_tokens += final_turn.input_tokens
+            total_output_tokens += final_turn.output_tokens
+            message = final_turn.text or "Flow tayyor. Natija `tool_result.data.flow` ichida."
             await store.set_status(request_id, "completed", final_response=message)
-            await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
+            await store.add_event(
+                request_id,
+                "assistant_message",
+                {
+                    "text": message,
+                    "usage": {
+                        "input_tokens": final_turn.input_tokens,
+                        "output_tokens": final_turn.output_tokens,
+                    },
+                },
+            )
+            await report_usage_if_needed(
+                settings=settings,
+                user_id=user_id,
+                project_id=project_id,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+            )
             await store.add_event(request_id, "run_completed", {"request_id": request_id})
         else:
             message = "Bot flow to'liq compile bo'lmadi. Issues: " + ", ".join(issue["code"] for issue in issues)
@@ -348,7 +432,6 @@ async def _execute_run(
     except Exception as exc:
         message = str(exc)
         await store.set_status(request_id, "failed", error=message)
-        await store.add_event(request_id, "tool_result", {"tool_call_id": tool_call_id, "content": message, "is_error": True})
         await store.add_event(request_id, "run_failed", {"error": message})
     finally:
         await store.finish_streams(request_id)
@@ -384,49 +467,23 @@ def _sse_event(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 
-def is_flow_build_prompt(prompt: str) -> bool:
-    text = prompt.casefold()
-    build_markers = (
-        "bot yarat",
-        "bot yas",
-        "bot qur",
-        "flow yarat",
-        "flow qur",
-        "oqim yarat",
-        "воронк",
-        "создай",
-        "сделай бот",
-        "build",
-        "create bot",
-        "make bot",
-        "add node",
-        "connect",
-    )
-    edit_markers = (
-        "qo'sh",
-        "qosh",
-        "o'zgartir",
-        "ozgartir",
-        "tahrir",
-        "ulab",
-        "ulang",
-        "trigger",
-        "tugma",
-        "button",
-        "node",
-        "deploy",
-    )
-    if any(marker in text for marker in build_markers):
-        return True
-    return ("bot" in text or "flow" in text) and any(marker in text for marker in edit_markers)
-
-
-def conversational_reply(prompt: str) -> str:
-    text = prompt.casefold()
-    if "isming" in text or "oting" in text or "who are you" in text or "your name" in text:
-        return (
-            "Salom! Men Botmother AgentV4man. Bot flow tuzish, o'zgartirish va tekshirishda yordam beraman."
+async def report_usage_if_needed(
+    *,
+    settings: Settings,
+    user_id: str,
+    project_id: str | None,
+    input_tokens: int,
+    output_tokens: int,
+) -> None:
+    if not settings.report_token_usage or not (input_tokens or output_tokens):
+        return
+    try:
+        backend = get_backend_client(settings)
+        await backend.report_token_usage(
+            user_id=user_id,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            project_id=project_id,
         )
-    if "salom" in text or "assalomu" in text or "hello" in text or "hi" in text:
-        return "Salom! Men shu yerdaman. Qanday bot yoki flow ustida ishlaymiz?"
-    return "Tushundim. Bot yoki flow bo'yicha nima qilishim kerakligini yozing, men yordam beraman."
+    except Exception:
+        pass

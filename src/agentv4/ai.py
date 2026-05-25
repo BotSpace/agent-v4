@@ -4,8 +4,11 @@ import json
 import re
 import urllib.error
 import urllib.request
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+
+import httpx
 
 from pydantic import BaseModel, Field, TypeAdapter
 
@@ -105,6 +108,75 @@ async def build_bot_with_ai(request: AIBuildRequest) -> AIBuildResponse:
     )
 
 
+async def build_bot_with_ai_stream(
+    request: AIBuildRequest,
+    *,
+    on_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> AIBuildResponse:
+    settings = get_settings()
+    api_key = settings.openai_api_key
+    if not api_key:
+        raise AIConfigurationError("OPENAI_API_KEY is not configured")
+
+    model = request.model or settings.openai_model
+
+    attempts = 0
+    feedback = ""
+    last_commands: list[BotCommand] = []
+    last_result: CompileResult | None = None
+    last_error: Exception | None = None
+    input_tokens = 0
+    output_tokens = 0
+
+    while attempts <= request.max_repair_attempts:
+        attempts += 1
+        response = await call_openai_stream(
+            api_key=api_key,
+            model=model,
+            request=request,
+            feedback=feedback,
+            on_delta=on_delta,
+        )
+        raw = response.content
+        input_tokens += response.input_tokens
+        output_tokens += response.output_tokens
+        try:
+            commands = parse_commands(raw)
+        except Exception as exc:
+            last_error = exc
+            feedback = (
+                "Command JSON parse error: "
+                f"{exc}. Return exact BotBuilder command objects. Use `action`, not `command`."
+            )
+            continue
+        result = build_from_commands(commands)
+        last_commands = commands
+        last_result = result
+        if result.ok:
+            return AIBuildResponse(
+                ok=True,
+                model=model,
+                attempts=attempts,
+                commands=[command.model_dump(mode="json") for command in commands],
+                result=result,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+        feedback = format_issues(result)
+
+    if last_result is None:
+        raise ValueError(f"AI did not produce valid BotBuilder commands: {last_error}")
+    return AIBuildResponse(
+        ok=False,
+        model=model,
+        attempts=attempts,
+        commands=[command.model_dump(mode="json") for command in last_commands],
+        result=last_result,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+
+
 async def call_openai(
     *,
     api_key: str,
@@ -125,6 +197,82 @@ async def call_openai(
         ),
         timeout=timeout + 5,
     )
+
+
+async def call_openai_stream(
+    *,
+    api_key: str,
+    model: str,
+    request: AIBuildRequest,
+    feedback: str,
+    on_delta: Callable[[str], Awaitable[None]] | None = None,
+) -> OpenAIResult:
+    settings = get_settings()
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt()},
+            {
+                "role": "user",
+                "content": user_prompt(request.prompt, language=request.language, feedback=feedback),
+            },
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+        "max_tokens": settings.openai_max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+
+    body_parts: list[str] = []
+    input_tokens = 0
+    output_tokens = 0
+    timeout = httpx.Timeout(settings.openai_timeout + 5, connect=settings.openai_timeout)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream(
+            "POST",
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+        ) as response:
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                detail = await response.aread()
+                raise ValueError(
+                    f"OpenAI HTTP {response.status_code}: {detail.decode('utf-8', errors='replace')}"
+                ) from exc
+
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+
+                chunk = json.loads(data)
+                choices = chunk.get("choices") or []
+                if choices:
+                    delta = ((choices[0] or {}).get("delta") or {}).get("content")
+                    if isinstance(delta, str) and delta:
+                        body_parts.append(delta)
+                        if on_delta is not None:
+                            await on_delta(delta)
+
+                usage = chunk.get("usage") or {}
+                input_tokens = int(usage.get("prompt_tokens") or input_tokens or 0)
+                output_tokens = int(usage.get("completion_tokens") or output_tokens or 0)
+
+    content = "".join(body_parts)
+    if not content:
+        raise ValueError("OpenAI returned an empty response")
+    return OpenAIResult(content=content, input_tokens=input_tokens, output_tokens=output_tokens)
 
 
 def call_openai_sync(

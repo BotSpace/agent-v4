@@ -105,7 +105,10 @@ def test_usage_compat_endpoint() -> None:
 
 
 def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
-    async def fake_build_bot_with_ai(request):
+    async def fake_build_bot_with_ai_stream(request, *, on_delta=None):
+        if on_delta is not None:
+            await on_delta('{"commands":[')
+            await on_delta('{"action":"create_bot"}]}')
         commands = [
             CreateBotCommand(action="create_bot", name="Compat bot", language="uz"),
             AddTextCommand(action="add_text", key="welcome", text=request.prompt, after="start"),
@@ -119,7 +122,7 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
             result=result,
         )
 
-    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai", fake_build_bot_with_ai)
+    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fake_build_bot_with_ai_stream)
     client = TestClient(create_app())
 
     created = client.post(
@@ -135,6 +138,7 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
 
     assert "event: run_started" in stream_text
     assert "event: tool_call" in stream_text
+    assert "event: thinking_delta" in stream_text
     assert "event: tool_result" in stream_text
     assert "event: assistant_message" in stream_text
     assert "event: run_completed" in stream_text
@@ -146,10 +150,10 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
 
 
 def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
-    async def fail_build_bot_with_ai(_request):
+    async def fail_build_bot_with_ai_stream(_request, *, on_delta=None):
         raise AssertionError("casual chat should not call botbuilder")
 
-    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai", fail_build_bot_with_ai)
+    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fail_build_bot_with_ai_stream)
     client = TestClient(create_app())
 
     created = client.post(
