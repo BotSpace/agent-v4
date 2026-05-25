@@ -10,6 +10,9 @@ imagePullSecrets:
 
 fullnameOverride: "agent-v4"
 
+podAnnotations:
+  agent-v4.botspace.uz/secret-rollout: "2026-05-25T11:59:23Z"
+
 serviceAccount:
   create: false
   name: ""
