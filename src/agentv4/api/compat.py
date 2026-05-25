@@ -952,9 +952,17 @@ async def execute_backend_tool(
                 return "Subscription payload is invalid.", {"subscription": subscription}, True
 
             plan_raw = subscription.get("plan")
+            plan_details = subscription.get("plan_details")
             plan_name = subscription.get("plan_name")
             if isinstance(plan_raw, dict):
                 plan_name = plan_raw.get("name") or plan_raw.get("display") or plan_name
+            elif isinstance(plan_details, dict):
+                plan_name = (
+                    plan_details.get("name")
+                    or plan_details.get("display")
+                    or plan_details.get("status_display")
+                    or plan_name
+                )
             elif isinstance(plan_raw, (int, str)):
                 # Some backend serializers return plan as id only.
                 plan_name = plan_name or f"plan#{plan_raw}"
