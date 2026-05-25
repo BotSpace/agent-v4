@@ -358,17 +358,6 @@ async def _execute_run(
             )
         total_input_tokens += result.input_tokens
         total_output_tokens += result.output_tokens
-        if settings.report_token_usage and (result.input_tokens or result.output_tokens):
-            try:
-                backend = get_backend_client(settings)
-                await backend.report_token_usage(
-                    user_id=user_id,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                    project_id=project_id,
-                )
-            except Exception:
-                pass
         flow = result.result.flow.model_dump(mode="json") if result.result.flow else None
         issues = [issue.model_dump(mode="json") for issue in result.result.issues]
         tool_content = "Flow compiled" if result.ok else "Flow validation failed"

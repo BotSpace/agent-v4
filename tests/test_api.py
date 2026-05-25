@@ -6,6 +6,7 @@ from agentv4.ai import AIBuildResponse
 from agentv4.backend import get_backend_client
 from agentv4.builder.commands import CreateBotCommand, AddTextCommand
 from agentv4.builder.session import build_from_commands
+from agentv4.compat_agent import BOTBUILDER_TOOL_NAME, CompatAgentTurn, CompatToolCall
 from agentv4.config import get_settings
 
 
@@ -105,6 +106,27 @@ def test_usage_compat_endpoint() -> None:
 
 
 def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
+    async def fake_agent_turn(_prompt, *, settings=None):
+        return CompatAgentTurn(
+            text="Bot yaratish uchun tool chaqiraman.",
+            tool_calls=[
+                CompatToolCall(
+                    id="tool-call-1",
+                    name=BOTBUILDER_TOOL_NAME,
+                    arguments={"prompt": "Kafe bot yarat"},
+                )
+            ],
+            input_tokens=5,
+            output_tokens=7,
+        )
+
+    async def fake_agent_final(*_args, **_kwargs):
+        return CompatAgentTurn(
+            text="Bot flow tayyor. Flow JSON `tool_result.data.flow` ichida qaytdi.",
+            input_tokens=3,
+            output_tokens=4,
+        )
+
     async def fake_build_bot_with_ai_stream(request, *, on_delta=None):
         if on_delta is not None:
             await on_delta('{"commands":[')
@@ -122,6 +144,8 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
             result=result,
         )
 
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_final", fake_agent_final)
     monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fake_build_bot_with_ai_stream)
     client = TestClient(create_app())
 
@@ -150,9 +174,17 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
 
 
 def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
+    async def fake_agent_turn(_prompt, *, settings=None):
+        return CompatAgentTurn(
+            text="Salom! Men Botmother AgentV4man. Bot flow tuzishda yordam beraman.",
+            input_tokens=4,
+            output_tokens=6,
+        )
+
     async def fail_build_bot_with_ai_stream(_request, *, on_delta=None):
         raise AssertionError("casual chat should not call botbuilder")
 
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
     monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fail_build_bot_with_ai_stream)
     client = TestClient(create_app())
 
