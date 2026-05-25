@@ -26,7 +26,7 @@ from ..compat_agent import (
     TOOL_EVENT_NAMES,
     compat_system_prompt,
 )
-from ..compat_agent import run_compat_agent_final, run_compat_agent_messages, run_compat_agent_turn
+from ..compat_agent import run_compat_agent_final, run_compat_agent_messages
 from ..config import Settings
 from ..limits import require_available_ai_tokens
 from .auth import CurrentUser, get_current_user
@@ -82,6 +82,8 @@ class CompatRun:
 class CompatRunStore:
     def __init__(self) -> None:
         self._runs: dict[str, CompatRun] = {}
+        self._thread_messages: dict[tuple[str, str], list[dict[str, str]]] = {}
+        self._thread_project_ids: dict[tuple[str, str], str] = {}
         self._lock = asyncio.Lock()
 
     async def create(
@@ -111,6 +113,45 @@ class CompatRunStore:
             if run is None or run.project_id != project_id or run.user_id != user_id:
                 return None
             return run
+
+    async def thread_context(
+        self,
+        *,
+        user_id: str,
+        thread_id: str | None,
+        fallback_project_id: str,
+    ) -> tuple[list[dict[str, str]], str]:
+        if thread_id is None:
+            return [], fallback_project_id
+        key = (user_id, thread_id)
+        async with self._lock:
+            messages = list(self._thread_messages.get(key, []))
+            project_id = self._thread_project_ids.get(key) or fallback_project_id
+        return messages, project_id
+
+    async def append_thread_message(
+        self,
+        *,
+        user_id: str,
+        thread_id: str | None,
+        role: str,
+        content: str,
+        limit: int = 20,
+    ) -> None:
+        if thread_id is None or not content:
+            return
+        key = (user_id, thread_id)
+        async with self._lock:
+            messages = self._thread_messages.setdefault(key, [])
+            messages.append({"role": role, "content": content})
+            if len(messages) > limit:
+                del messages[: len(messages) - limit]
+
+    async def set_thread_project_id(self, *, user_id: str, thread_id: str | None, project_id: str | int | None) -> None:
+        if thread_id is None or project_id is None:
+            return
+        async with self._lock:
+            self._thread_project_ids[(user_id, thread_id)] = str(project_id)
 
     async def set_status(
         self,
@@ -286,8 +327,29 @@ async def _execute_run(
 ) -> None:
     await store.set_status(request_id, "running")
     await store.add_event(request_id, "run_started", {"request_id": request_id})
+    final_message: str | None = None
+    completed_successfully = False
+    user_id = ""
+    thread_id: str | None = None
     try:
-        first_turn = await run_compat_agent_turn(prompt, settings=settings)
+        async with store._lock:
+            run = store._runs.get(request_id)
+            project_id = run.project_id if run else None
+            user_id = run.user_id if run else ""
+            thread_id = run.thread_id if run else None
+            auth_claims = run.auth_claims if run else {}
+        history, current_project_id = await store.thread_context(
+            user_id=user_id,
+            thread_id=thread_id,
+            fallback_project_id=project_id or "",
+        )
+        await store.append_thread_message(user_id=user_id, thread_id=thread_id, role="user", content=prompt)
+
+        first_turn = await run_compat_agent_messages(
+            _initial_agent_messages(prompt, history=history, current_project_id=current_project_id),
+            settings=settings,
+            allow_tools=True,
+        )
         total_input_tokens = first_turn.input_tokens
         total_output_tokens = first_turn.output_tokens
         if first_turn.text:
@@ -303,15 +365,12 @@ async def _execute_run(
                 },
             )
 
-        async with store._lock:
-            run = store._runs.get(request_id)
-            project_id = run.project_id if run else None
-            user_id = run.user_id if run else ""
-
         tool_call = next((call for call in first_turn.tool_calls if call.name in TOOL_EVENT_NAMES), None)
         if tool_call is None:
             message = first_turn.text or "Tushundim."
             await store.set_status(request_id, "completed", final_response=message)
+            final_message = message
+            completed_successfully = True
             await report_usage_if_needed(
                 settings=settings,
                 user_id=user_id,
@@ -336,12 +395,14 @@ async def _execute_run(
             message, is_error, loop_input, loop_output = await execute_backend_tool_loop(
                 store,
                 request_id,
-                prompt=prompt,
                 first_turn=first_turn,
                 first_tool_call=tool_call,
                 settings=settings,
-                auth_claims=run.auth_claims if run else {},
-                current_project_id=project_id,
+                auth_claims=auth_claims,
+                current_project_id=current_project_id,
+                base_messages=_initial_agent_messages(prompt, history=history, current_project_id=current_project_id),
+                user_id=user_id,
+                thread_id=thread_id,
             )
             total_input_tokens += loop_input
             total_output_tokens += loop_output
@@ -351,6 +412,8 @@ async def _execute_run(
                 final_response=message,
                 error=message if is_error else None,
             )
+            final_message = message
+            completed_successfully = not is_error
             await report_usage_if_needed(
                 settings=settings,
                 user_id=user_id,
@@ -421,6 +484,42 @@ async def _execute_run(
             },
         )
         if result.ok:
+            saved_project_id = current_project_id
+            if flow and saved_project_id:
+                save_content, save_data, save_error = await save_flow_to_project(
+                    settings=settings,
+                    auth_claims=auth_claims,
+                    project_id=saved_project_id,
+                    flow=flow,
+                )
+                await store.add_event(
+                    request_id,
+                    "tool_call",
+                    {
+                        "id": f"{tool_call.id}:project_update",
+                        "name": TOOL_EVENT_NAMES[PROJECT_UPDATE_TOOL_NAME],
+                        "arguments": {"id": saved_project_id, "flow": "<compiled_flow>"},
+                    },
+                )
+                await store.add_event(
+                    request_id,
+                    "tool_result",
+                    {
+                        "tool_call_id": f"{tool_call.id}:project_update",
+                        "content": save_content,
+                        "is_error": save_error,
+                        "data": save_data,
+                    },
+                )
+                tool_data["saved_project_id"] = saved_project_id
+                tool_data["save"] = save_data
+                if save_error:
+                    message = f"Flow compile bo'ldi, lekin project `{saved_project_id}` ga saqlanmadi: {save_content}"
+                    await store.set_status(request_id, "failed", error=message)
+                    final_message = message
+                    await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
+                    await store.add_event(request_id, "run_failed", {"error": message})
+                    return
             final_turn = await run_compat_agent_final(
                 prompt,
                 assistant_text=first_turn.text,
@@ -433,6 +532,8 @@ async def _execute_run(
             total_output_tokens += final_turn.output_tokens
             message = final_turn.text or "Flow tayyor. Natija `tool_result.data.flow` ichida."
             await store.set_status(request_id, "completed", final_response=message)
+            final_message = message
+            completed_successfully = True
             await store.add_event(
                 request_id,
                 "assistant_message",
@@ -455,6 +556,7 @@ async def _execute_run(
         else:
             message = "Bot flow to'liq compile bo'lmadi. Issues: " + ", ".join(issue["code"] for issue in issues)
             await store.set_status(request_id, "failed", error=message)
+            final_message = message
             await store.add_event(request_id, "assistant_message", {"text": message, "usage": {}})
             await store.add_event(request_id, "run_failed", {"error": message})
     except asyncio.CancelledError:
@@ -465,6 +567,8 @@ async def _execute_run(
         await store.set_status(request_id, "failed", error=message)
         await store.add_event(request_id, "run_failed", {"error": message})
     finally:
+        if completed_successfully and final_message:
+            await store.append_thread_message(user_id=user_id, thread_id=thread_id, role="assistant", content=final_message)
         await store.finish_streams(request_id)
 
 
@@ -520,22 +624,54 @@ async def report_usage_if_needed(
         pass
 
 
+def _initial_agent_messages(
+    prompt: str,
+    *,
+    history: list[dict[str, str]],
+    current_project_id: str | None,
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = [{"role": "system", "content": compat_system_prompt()}]
+    if current_project_id:
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Current Botmother project_id is `{current_project_id}`. Use it for 'this project' requests.",
+            }
+        )
+    messages.extend(history[-20:])
+    messages.append({"role": "user", "content": prompt})
+    return messages
+
+
+async def save_flow_to_project(
+    *,
+    settings: Settings,
+    auth_claims: dict[str, Any],
+    project_id: str | int,
+    flow: dict[str, Any],
+) -> tuple[str, dict[str, Any], bool]:
+    try:
+        project = await get_backend_client(settings).update_project(project_id, {"flow": flow}, auth_claims=auth_claims)
+        return f"Flow saved to project `{project_id}`.", {"project": project, "project_id": project_id}, False
+    except Exception as exc:
+        return f"Backend error: {exc}", {"project_id": project_id, "error": str(exc)}, True
+
+
 async def execute_backend_tool_loop(
     store: CompatRunStore,
     request_id: str,
     *,
-    prompt: str,
     first_turn: CompatAgentTurn,
     first_tool_call: CompatToolCall,
     settings: Settings,
     auth_claims: dict[str, Any],
     current_project_id: str | None,
+    base_messages: list[dict[str, Any]],
+    user_id: str,
+    thread_id: str | None,
     max_tool_rounds: int = 6,
 ) -> tuple[str, bool, int, int]:
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": compat_system_prompt()},
-        {"role": "user", "content": prompt},
-    ]
+    messages = list(base_messages)
     current_turn = first_turn
     current_tool_call = first_tool_call
     input_tokens = 0
@@ -561,6 +697,10 @@ async def execute_backend_tool_loop(
                 "data": tool_data,
             },
         )
+        next_project_id = _project_id_from_tool_result(current_tool_call.name, current_tool_call.arguments, tool_data)
+        if next_project_id is not None:
+            current_project_id = str(next_project_id)
+            await store.set_thread_project_id(user_id=user_id, thread_id=thread_id, project_id=current_project_id)
         messages.extend(_tool_exchange_messages(current_turn, current_tool_call, tool_content, tool_data))
 
         next_turn = await run_compat_agent_messages(
@@ -648,6 +788,25 @@ def _limit_arg(arguments: dict[str, Any], default: int, maximum: int) -> int:
     except (TypeError, ValueError):
         value = default
     return max(1, min(value, maximum))
+
+
+def _project_id_from_tool_result(
+    tool_name: str,
+    arguments: dict[str, Any],
+    tool_data: dict[str, Any],
+) -> str | int | None:
+    if tool_name == PROJECT_CREATE_TOOL_NAME:
+        project = tool_data.get("project")
+        if isinstance(project, dict):
+            return project.get("id")
+    if tool_name == PROJECT_GET_TOOL_NAME:
+        return arguments.get("id")
+    if tool_name == PROJECT_UPDATE_TOOL_NAME:
+        project = tool_data.get("project")
+        if isinstance(project, dict):
+            return project.get("id") or arguments.get("id")
+        return arguments.get("id")
+    return None
 
 
 async def execute_backend_tool(

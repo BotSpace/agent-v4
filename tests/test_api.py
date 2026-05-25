@@ -106,7 +106,11 @@ def test_usage_compat_endpoint() -> None:
 
 
 def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
-    async def fake_agent_turn(_prompt, *, settings=None):
+    class FakeBackend:
+        async def update_project(self, project_id, body, *, auth_claims=None):
+            return {"id": project_id, **body}
+
+    async def fake_agent_turn(_messages, *, settings=None, allow_tools=True):
         return CompatAgentTurn(
             text="Bot yaratish uchun tool chaqiraman.",
             tool_calls=[
@@ -144,9 +148,10 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
             result=result,
         )
 
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_turn)
     monkeypatch.setattr("agentv4.api.compat.run_compat_agent_final", fake_agent_final)
     monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fake_build_bot_with_ai_stream)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
     client = TestClient(create_app())
 
     created = client.post(
@@ -164,6 +169,7 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
     assert "event: tool_call" in stream_text
     assert "event: thinking_delta" in stream_text
     assert "event: tool_result" in stream_text
+    assert "project.update" in stream_text
     assert "event: assistant_message" in stream_text
     assert "event: run_completed" in stream_text
 
@@ -174,7 +180,7 @@ def test_agentv3_compat_run_lifecycle(monkeypatch) -> None:
 
 
 def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
-    async def fake_agent_turn(_prompt, *, settings=None):
+    async def fake_agent_turn(_messages, *, settings=None, allow_tools=True):
         return CompatAgentTurn(
             text="Salom! Men Botmother AgentV4man. Bot flow tuzishda yordam beraman.",
             input_tokens=4,
@@ -184,7 +190,7 @@ def test_agentv3_compat_casual_chat_does_not_build_flow(monkeypatch) -> None:
     async def fail_build_bot_with_ai_stream(_request, *, on_delta=None):
         raise AssertionError("casual chat should not call botbuilder")
 
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_turn)
     monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fail_build_bot_with_ai_stream)
     client = TestClient(create_app())
 
@@ -217,7 +223,17 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
                 {"id": 2, "name": "Support bot", "status": "draft"},
             ]
 
-    async def fake_agent_turn(_prompt, *, settings=None):
+    calls = 0
+
+    async def fake_agent_messages(_messages, *, settings=None, allow_tools=True):
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return CompatAgentTurn(
+                text="2 ta loyiha topildi: Kafe bot va Support bot.",
+                input_tokens=3,
+                output_tokens=4,
+            )
         return CompatAgentTurn(
             text="Loyihalarni tekshiraman.",
             tool_calls=[
@@ -231,18 +247,10 @@ def test_agentv3_compat_can_list_projects_with_tool(monkeypatch) -> None:
             output_tokens=6,
         )
 
-    async def fake_agent_next(*_args, **_kwargs):
-        return CompatAgentTurn(
-            text="2 ta loyiha topildi: Kafe bot va Support bot.",
-            input_tokens=3,
-            output_tokens=4,
-        )
-
     async def fail_build_bot_with_ai_stream(_request, *, on_delta=None):
         raise AssertionError("project listing should not call botbuilder")
 
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_next)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_messages)
     monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fail_build_bot_with_ai_stream)
     monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
     client = TestClient(create_app())
@@ -278,20 +286,19 @@ def test_agentv3_compat_can_chain_project_management_tools(monkeypatch) -> None:
         async def create_release(self, project_id, *, plan_id=None, months=None, auth_claims=None):
             return {"id": 77, "project": project_id, "plan_id": plan_id, "months": months, "version": 1}
 
-    async def fake_agent_turn(_prompt, *, settings=None):
-        return CompatAgentTurn(
-            text="Avval tariflarni tekshiraman.",
-            tool_calls=[CompatToolCall(id="plans-call", name="plans_list", arguments={})],
-            input_tokens=5,
-            output_tokens=6,
-        )
-
     calls = 0
 
-    async def fake_agent_next(*_args, **_kwargs):
+    async def fake_agent_messages(*_args, **_kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
+            return CompatAgentTurn(
+                text="Avval tariflarni tekshiraman.",
+                tool_calls=[CompatToolCall(id="plans-call", name="plans_list", arguments={})],
+                input_tokens=5,
+                output_tokens=6,
+            )
+        if calls == 2:
             return CompatAgentTurn(
                 text="Start tarif topildi, deploy qilaman.",
                 tool_calls=[
@@ -310,8 +317,7 @@ def test_agentv3_compat_can_chain_project_management_tools(monkeypatch) -> None:
             output_tokens=4,
         )
 
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_turn", fake_agent_turn)
-    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_next)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_messages)
     monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
     client = TestClient(create_app())
 
@@ -333,6 +339,128 @@ def test_agentv3_compat_can_chain_project_management_tools(monkeypatch) -> None:
     status = client.get(f"/projects/project_9/runs/{request_id}")
     assert status.status_code == 200
     assert status.json()["status"] == "completed"
+
+
+def test_agentv3_compat_remembers_thread_messages(monkeypatch) -> None:
+    seen_second_messages = []
+
+    async def fake_agent_messages(messages, *, settings=None, allow_tools=True):
+        if messages[-1]["content"] == "meni ismim samandar":
+            return CompatAgentTurn(text="Tanishganimdan xursandman, Samandar.", input_tokens=2, output_tokens=3)
+        seen_second_messages.extend(messages)
+        return CompatAgentTurn(text="Sizning ismingiz Samandar.", input_tokens=4, output_tokens=5)
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_messages)
+    client = TestClient(create_app())
+
+    first = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "meni ismim samandar", "thread_id": "memory_thread"},
+    )
+    assert first.status_code == 200
+    with client.stream("GET", f"/projects/project_1/runs/{first.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        _ = "".join(response.iter_text())
+
+    second = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "meni ismim nima", "thread_id": "memory_thread"},
+    )
+    assert second.status_code == 200
+    with client.stream("GET", f"/projects/project_1/runs/{second.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "Sizning ismingiz Samandar" in stream_text
+    assert any(item["role"] == "user" and item["content"] == "meni ismim samandar" for item in seen_second_messages)
+
+
+def test_agentv3_compat_uses_created_project_for_next_flow_save(monkeypatch) -> None:
+    saved: dict[str, object] = {}
+
+    class FakeBackend:
+        async def create_project(self, body, *, auth_claims=None):
+            return {"id": 981, "name": body["name"], "status": "draft"}
+
+        async def update_project(self, project_id, body, *, auth_claims=None):
+            saved["project_id"] = project_id
+            saved["body"] = body
+            return {"id": project_id, **body}
+
+    calls = 0
+
+    async def fake_agent_messages(messages, *, settings=None, allow_tools=True):
+        nonlocal calls
+        calls += 1
+        current_prompt = next(item["content"] for item in reversed(messages) if item["role"] == "user")
+        if current_prompt == "loyiha yarat ai agent test nomli":
+            if messages[-1]["role"] != "tool":
+                return CompatAgentTurn(
+                    text="Loyiha yarataman.",
+                    tool_calls=[
+                        CompatToolCall(
+                            id="create-project",
+                            name="project_create",
+                            arguments={"name": "ai agent test"},
+                        )
+                    ],
+                )
+            return CompatAgentTurn(text='Loyiha "ai agent test" yaratildi. ID: 981.')
+        return CompatAgentTurn(
+            text="Flow yarataman.",
+            tool_calls=[
+                CompatToolCall(
+                    id="build-flow",
+                    name=BOTBUILDER_TOOL_NAME,
+                    arguments={"prompt": current_prompt},
+                )
+            ],
+        )
+
+    async def fake_agent_final(*_args, **_kwargs):
+        return CompatAgentTurn(text="Flow yaratildi va loyihaga saqlandi.")
+
+    async def fake_build_bot_with_ai_stream(request, *, on_delta=None):
+        commands = [
+            CreateBotCommand(action="create_bot", name="Compat bot", language="uz"),
+            AddTextCommand(action="add_text", key="welcome", text="Salom", after="start"),
+        ]
+        return AIBuildResponse(
+            ok=True,
+            model="fake",
+            attempts=1,
+            commands=[command.model_dump(mode="json") for command in commands],
+            result=build_from_commands(commands),
+        )
+
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_messages", fake_agent_messages)
+    monkeypatch.setattr("agentv4.api.compat.run_compat_agent_final", fake_agent_final)
+    monkeypatch.setattr("agentv4.api.compat.build_bot_with_ai_stream", fake_build_bot_with_ai_stream)
+    monkeypatch.setattr("agentv4.api.compat.get_backend_client", lambda settings: FakeBackend())
+    client = TestClient(create_app())
+
+    first = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "loyiha yarat ai agent test nomli", "thread_id": "project_thread"},
+    )
+    assert first.status_code == 200
+    with client.stream("GET", f"/projects/project_1/runs/{first.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        _ = "".join(response.iter_text())
+
+    second = client.post(
+        "/projects/project_1/runs",
+        json={"prompt": "endi shu loyihaga start bossa salom deydigan qilib ber", "thread_id": "project_thread"},
+    )
+    assert second.status_code == 200
+    with client.stream("GET", f"/projects/project_1/runs/{second.json()['request_id']}/events") as response:
+        assert response.status_code == 200
+        stream_text = "".join(response.iter_text())
+
+    assert "project.update" in stream_text
+    assert saved["project_id"] == "981"
+    assert isinstance(saved["body"], dict)
+    assert "flow" in saved["body"]
 
 
 def test_run_requires_auth_when_enabled(monkeypatch) -> None:
