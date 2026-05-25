@@ -486,25 +486,36 @@ async def _execute_run(
         tool_prompt = str(tool_call.arguments.get("prompt") or prompt)
         stream_buffer = ""
         stream_started = False
+        progress_step = 0
+        progress_messages = [
+            "Bot flow tayyorlanmoqda...\n",
+            "Kerakli node va bog'lanishlar tanlanmoqda...\n",
+            "Bot mantiqi yig'ilmoqda...\n",
+            "Flow tekshiruvga tayyorlanmoqda...\n",
+        ]
 
         async def emit_stream_progress(delta: str) -> None:
-            nonlocal stream_buffer, stream_started
+            nonlocal stream_buffer, stream_started, progress_step
             if not stream_started:
                 stream_started = True
                 await store.add_event(
                     request_id,
                     "thinking_delta",
-                    {"delta": "Model javobni real time tayyorlayapti...\n"},
+                    {"delta": progress_messages[progress_step]},
                 )
+                progress_step += 1
             stream_buffer += delta
             if len(stream_buffer) < 120:
                 return
             stream_buffer = ""
+            if progress_step >= len(progress_messages):
+                return
             await store.add_event(
                 request_id,
                 "thinking_delta",
-                {"delta": "Yangi chunk olindi, bot komandalar yig'ilmoqda...\n"},
+                {"delta": progress_messages[progress_step]},
             )
+            progress_step += 1
 
         result = await build_bot_with_ai_stream(
             AIBuildRequest(prompt=tool_prompt, language="uz", max_repair_attempts=2),
@@ -514,7 +525,7 @@ async def _execute_run(
             await store.add_event(
                 request_id,
                 "thinking_delta",
-                {"delta": "Model javobi olindi, flow compile qilinmoqda...\n"},
+                {"delta": "Flow tekshirilmoqda va saqlashga tayyorlanmoqda...\n"},
             )
         total_input_tokens += result.input_tokens
         total_output_tokens += result.output_tokens
