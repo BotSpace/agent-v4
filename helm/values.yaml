@@ -1,0 +1,99 @@
+replicaCount: 1
+
+image:
+  repository: registry.iprogrammer.uz/botspace/agent-v4
+  tag: "latest"
+  pullPolicy: Always
+
+imagePullSecrets:
+  - name: iprogrammer-registry
+
+fullnameOverride: "agent-v4"
+
+serviceAccount:
+  create: false
+  name: ""
+
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+service:
+  enabled: true
+  type: ClusterIP
+  port: 8094
+  targetPort: 8094
+
+configMaps:
+  config:
+    AGENTV4_HOST: "0.0.0.0"
+    AGENTV4_PORT: "8094"
+    AGENTV4_OPENAI_MODEL: "gpt-4o-mini"
+    AGENTV4_OPENAI_TIMEOUT: "45"
+    AGENTV4_OPENAI_MAX_TOKENS: "1800"
+
+envFrom:
+  - secretRef:
+      name: agent-secret
+      optional: true
+  - secretRef:
+      name: agent-v4-secret
+      optional: true
+
+probes:
+  startup:
+    enabled: true
+    type: httpGet
+    httpGet:
+      path: /health
+      port: 8094
+    initialDelaySeconds: 5
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 24
+  readiness:
+    enabled: true
+    type: httpGet
+    httpGet:
+      path: /health
+      port: 8094
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  liveness:
+    enabled: true
+    type: httpGet
+    httpGet:
+      path: /health
+      port: 8094
+    initialDelaySeconds: 30
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 3
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    cpu: 1000m
+    memory: 768Mi
+
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: name
+              operator: NotIn
+              values:
+                - base
+
+prometheus:
+  scrape: false
+  port: 8094
+
+terminationGracePeriodSeconds: 30

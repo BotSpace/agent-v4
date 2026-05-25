@@ -1,0 +1,20 @@
+image:
+  tag: "latest"
+
+configMaps:
+  config:
+    AGENTV4_HOST: "0.0.0.0"
+    AGENTV4_PORT: "8094"
+    AGENTV4_OPENAI_MODEL: "gpt-4o-mini"
+    AGENTV4_OPENAI_TIMEOUT: "45"
+    AGENTV4_OPENAI_MAX_TOKENS: "1800"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    cpu: 1000m
+    memory: 768Mi
+
+affinity: {}
