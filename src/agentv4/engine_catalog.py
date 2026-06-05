@@ -82,6 +82,12 @@ ENGINE_NODE_CATALOG = {
         "DeleteCollectionNode": {"collection_name": "leads", "filters": []},
         "DownloadNode": {"file": "{{state_file_id}}", "key": "downloaded_file"},
         "SendToAdminNode": {"message": "New request", "adminChatIds": []},
+        "PaymentNode": {
+            "paymentType": "click",
+            "amount": 10000,
+            "comment": "To'lov",
+            "buttonText": "💳 To'lash",
+        },
     },
 }
 
@@ -215,6 +221,12 @@ ENGINE_NODE_SPECS: dict[str, EngineNodeSpec] = {
     ),
     "DownloadNode": EngineNodeSpec(ENGINE_NODE_CATALOG["data_integrations"]["DownloadNode"], frozenset({"file", "key"})),
     "SendToAdminNode": EngineNodeSpec(ENGINE_NODE_CATALOG["data_integrations"]["SendToAdminNode"]),
+    # Botspace orqali Click to'lovi — paid/failed branch. Egasi to'lov tizimi bilan integratsiya qilmaydi.
+    "PaymentNode": EngineNodeSpec(
+        ENGINE_NODE_CATALOG["data_integrations"]["PaymentNode"],
+        frozenset({"amount"}),
+        frozenset({"paid", "failed"}),
+    ),
 }
 
 
